@@ -3,7 +3,7 @@
 **Objective:** Rework the ESP32 firmware to eliminate the Windows desktop application by implementing direct USB HID device emulation, making Switch 2 controllers plug-and-play without software installation.
 
 **Status:** Planning Phase  
-**Last Updated:** July 16, 2026
+**Last Updated:** July 20, 2026
 
 ---
 
@@ -43,7 +43,38 @@ The proposed architecture:
   - Report descriptors define exact controller shape to Windows
   - Runs at **150 MHz** (no overclock needed)
 
-### 1.2 Current Switch2Connect Architecture
+### 1.2 XinHeLianSheng-Pro2-Bridge Repository ⭐ PRIMARY REFERENCE
+**Closest existing implementation — same board, same controller, same architecture**
+
+- **Repository:** https://github.com/LeonChrome/XinHeLianSheng-Pro2-Bridge
+- **ESP32-S3 firmware branch:** `codex/v5.9.13-finale-dual-release`
+- **Why it matters:** This project already does exactly what this roadmap proposes — an ESP32-S3 N16R8 acting as BLE central to a real Switch 2 Pro controller while enumerating as a USB game controller via TinyUSB on the native USB port. Unlike DS5Dongle (RP2350/Pico SDK), it is built on **ESP-IDF 5.4.2**, so its build system and TinyUSB integration carry over directly.
+
+- **Key Files (branch `codex/v5.9.13-finale-dual-release`):**
+  - `firmware/esp32s3_switch2_bridge/main/usb/usb_descriptors.c` — Device/config/HID report descriptors for all identity modes
+  - `firmware/esp32s3_switch2_bridge/main/usb/hid_report.c` — Input report construction (neutral states, button bitmasks, stick encoding)
+  - `firmware/esp32s3_switch2_bridge/main/usb/usb_switch2_vendor.c` — Switch 2 vendor bulk protocol emulation (init handshake, flash reads, calibration)
+  - `firmware/esp32s3_switch2_bridge/main/usb/usb_hid_device.c` / `usb_xinput_device.c` — TinyUSB HID and XInput device drivers
+  - `firmware/esp32s3_switch2_bridge/main/tusb_config.h` — TinyUSB configuration for ESP32-S3
+  - `firmware/esp32s3_switch2_bridge/main/ble/`, `bridge/` — BLE central + BLE→USB conversion layer
+  - `firmware/esp32s3_dualsense_identity_experiment/` — Separate firmware emulating DualSense identity (054C:0CE6) with gyro + haptic audio routing
+
+- **Identity Modes (build profiles from one codebase):**
+  | Mode | VID:PID | Interface layout | Notes |
+  |------|---------|------------------|-------|
+  | Nintendo Pro (experiment) | `057E:2069` | HID (vendor page `0xFF00`) + vendor bulk (EP 0x82/0x02) | bcdUSB 2.01, strings "Nintendo Co., Ltd." / "Nintendo Switch Pro Controller", 500 mA |
+  | Switch Pro legacy (dual HID) | `057E` + legacy Pro PID | Two HID interfaces, both bidirectional, 1 ms polling | Classic Joy-Con/Pro report IDs (0x30 full state, 0x21 subcommand reply, etc.) |
+  | XInput | `045E:028E` | Single vendor-class interface (class 0xFF), 4/8 ms polling, 32-byte packets | Xbox 360 identity — broadest game compatibility |
+  | DualSense | `054C:0CE6` | HID + audio | Separate firmware tree, gyro + HD haptics |
+
+- **Key Insights:**
+  - **The Switch Pro identity is NOT a standard gamepad HID descriptor.** Nintendo mode uses vendor usage page `0xFF00` with raw 63-byte reports (input `0x05`, output `0x02`, feature `0x7F`). Windows recognizes it as HID but does **not** map it as a gamepad natively — Steam/SDL does the interpretation. This directly contradicts the "sticks/hat/buttons descriptor" assumption in Phase 3.1 and forces an identity-mode decision (see 3.1).
+  - **Switch 2 init handshake must be emulated** for the Nintendo identity: the vendor bulk interface answers command `0x02` (flash reads at `0x13000` serial, `0x13080`/`0x130C0` calibration), `0x03` (calibration, stick neutral = 2048), `0x15 0x01` (MAC address), plus a "Steam init guard" that gates HID IN reports until the host sends start-output (`0x03 0x0D`).
+  - **Rumble path proven:** HID output report `0x02` (subtype `0x5x`) → decoded → re-encoded as Pro 2 BLE vibration packets. Same relay concept as the existing `rumble_drive_channel()`.
+  - **BLE robustness:** fast connection parameters are deferred until input stabilizes to avoid reconnect loops — worth copying.
+  - Gates HID IN submissions immediately on TinyUSB bus reset (prevents stale-report lockups on replug).
+
+### 1.3 Current Switch2Connect Architecture
 **Baseline to understand and refactor**
 
 - **Repository:** https://github.com/TommyWabg/Switch2Connect
@@ -69,7 +100,7 @@ The proposed architecture:
   - **Report size:** 64 bytes
   - **Button layout:** Reverse-engineered from existing code
 
-### 1.3 USB HID Specification References
+### 1.4 USB HID Specification References
 **Standards for descriptor definition**
 
 - **USB HID Spec:** https://www.usb.org/sites/default/files/documents/hid1_11.pdf
@@ -177,6 +208,19 @@ The proposed architecture:
   └─ Report Count: 64 bytes total
   ```
 
+**⚠️ Identity Mode Decision (informed by XinHeLianSheng-Pro2-Bridge):**
+
+A real Switch (2) Pro Controller does **not** present a standard gamepad HID descriptor — it uses vendor usage page `0xFF00` with raw 63-byte reports that only Steam/SDL-aware software interprets. "Plug-and-play in Windows with no software" therefore depends on which USB identity we choose:
+
+| Identity | Windows native? | Steam/SDL? | XInput games? | Complexity |
+|----------|----------------|-----------|---------------|------------|
+| **Generic HID gamepad** (standard descriptor) | ✅ DirectInput | ✅ | ❌ (no XInput) | Low — pure descriptor work |
+| **XInput (045E:028E)** | ✅ | ✅ | ✅ | Medium — vendor-class interface, XInput packet format |
+| **Switch Pro (057E:2069)** | HID only (no gamepad mapping) | ✅ incl. gyro | ❌ | High — vendor bulk init handshake emulation |
+| **DualSense (054C:0CE6)** | Partial | ✅ incl. gyro | ❌ | High — DS5 report format + feature reports |
+
+**Recommendation:** Start with generic HID gamepad (Phase 1 milestone: enumerate + inputs work), then add XInput as a second build profile for game compatibility. Nintendo/DualSense identities become Phase 2 options if gyro passthrough via Steam is wanted. XinHeLianSheng-Pro2-Bridge demonstrates all of these as build-time profiles from one codebase — mirror that structure.
+
 **Deliverables:**
 - [ ] Reverse-engineer Switch 2 BLE report format
   - Button mapping (from existing firmware parsing)
@@ -226,15 +270,20 @@ The proposed architecture:
 
    **Reference:** [`DS5Dongle/src/usb.cpp`](https://github.com/awalol/DS5Dongle/blob/master/src/usb.cpp)
 
-**Key Constants:**
+**Key Constants (per identity mode — see decision table in 3.1):**
 ```c
-#define USB_VID         0x054C      // Sony
-#define USB_PID         0x0CE6      // DualSense / Switch2 emulation
+// Generic HID gamepad (Phase 1 recommendation)
+#define USB_VID         0x16C0      // Or project-specific VID
+#define USB_PID         0x05DF
+// XInput profile:   VID 0x045E, PID 0x028E (Xbox 360), vendor class 0xFF
+// Switch Pro:       VID 0x057E, PID 0x2069, bcdUSB 0x0201, + vendor bulk itf
+// DualSense:        VID 0x054C, PID 0x0CE6
+
 #define HID_REPORT_SIZE 64          // Standard gamepad report
 
 #define EP_HID_IN       0x81        // Endpoint for input reports
 #define EP_HID_OUT      0x01        // Endpoint for output (rumble)
-#define POLLING_RATE    0x01        // 1ms interval (125Hz)
+#define POLLING_RATE    0x01        // 1ms interval (XinHeLianSheng uses 1ms for HID modes)
 ```
 
 **Deliverables:**
@@ -412,13 +461,25 @@ void ble_to_hid_report(uint8_t *ble_data, uint8_t *hid_report) {
 
 | Resource | URL | Purpose |
 |----------|-----|---------|
-| **DS5Dongle** | https://github.com/awalol/DS5Dongle | Reference HID implementation |
+| **XinHeLianSheng-Pro2-Bridge** ⭐ | https://github.com/LeonChrome/XinHeLianSheng-Pro2-Bridge | Primary reference — ESP32-S3 BLE→USB bridge for Switch 2 Pro (branch `codex/v5.9.13-finale-dual-release`) |
+| **DS5Dongle** | https://github.com/awalol/DS5Dongle | Reference HID implementation (RP2350/Pico) |
 | **Switch2Connect** | https://github.com/TommyWabg/Switch2Connect | Current codebase to refactor |
 | **Nadeflore/switch2-controllers** | https://github.com/Nadeflore/switch2-controllers | Original Switch 2 BLE reverse engineering |
 
 ### Files to Study
 
-#### DS5Dongle (Reference Implementation)
+#### XinHeLianSheng-Pro2-Bridge (Primary Reference — branch `codex/v5.9.13-finale-dual-release`)
+| File | Purpose |
+|------|---------|
+| `firmware/esp32s3_switch2_bridge/main/usb/usb_descriptors.c` | Device/config/HID descriptors for Nintendo, Switch-legacy, XInput, generic modes |
+| `firmware/esp32s3_switch2_bridge/main/usb/hid_report.c` | Input report layouts, neutral states, button bitmasks |
+| `firmware/esp32s3_switch2_bridge/main/usb/usb_switch2_vendor.c` | Switch 2 vendor bulk init protocol (flash reads, calibration, MAC, Steam init guard) |
+| `firmware/esp32s3_switch2_bridge/main/usb/usb_xinput_device.c` | XInput vendor-class device implementation |
+| `firmware/esp32s3_switch2_bridge/main/tusb_config.h` | TinyUSB config for ESP32-S3 (ESP-IDF 5.4.2) |
+| `firmware/esp32s3_switch2_bridge/main/ble/`, `bridge/` | BLE central + BLE→USB conversion layer |
+| `firmware/esp32s3_dualsense_identity_experiment/` | DualSense identity firmware (gyro + haptic audio) |
+
+#### DS5Dongle (Secondary Reference)
 | File | Lines | Purpose |
 |------|-------|---------|
 | `src/usb_descriptors.cpp` | [1-133](https://github.com/awalol/DS5Dongle/blob/master/src/usb_descriptors.cpp#L1-L133) | Device & config descriptors |
@@ -464,11 +525,11 @@ void ble_to_hid_report(uint8_t *ble_data, uint8_t *hid_report) {
 - **USB cable** (for flashing and operation)
 
 ### Software
-- **Pico SDK 2.0+** (adapted for ESP32-S3 IDF framework)
-- **CMake 3.13+**
-- **arm-none-eabi-gcc** (ARM cross compiler)
+- **ESP-IDF 5.4.2+** (XinHeLianSheng-Pro2-Bridge validates this version; Pico SDK is NOT needed — that's DS5Dongle's RP2350 toolchain)
+- **CMake 3.13+** (bundled with ESP-IDF)
+- **Xtensa toolchain** (bundled with ESP-IDF; no arm-none-eabi-gcc)
 - **Python 3.8+** (for build tools)
-- **TinyUSB 0.21.0+**
+- **TinyUSB** (via ESP-IDF `esp_tinyusb` / managed component)
 - **NimBLE** (Bluetooth stack, already in use)
 
 ### Development Tools
@@ -566,12 +627,14 @@ void ble_to_hid_report(uint8_t *ble_data, uint8_t *hid_report) {
 - **[snipem/DS4Dongle](https://github.com/snipem/DS4Dongle)** — DualShock 4 variant
 
 ### Switch 2 Community Resources
+- **[LeonChrome/XinHeLianSheng-Pro2-Bridge](https://github.com/LeonChrome/XinHeLianSheng-Pro2-Bridge)** — ESP32-S3 BLE→USB bridge with four identity modes (primary reference, see 1.2)
 - **y700-switch2-pro-bridge** (mentioned in Switch2Connect README as reference)
 - **Nadeflore/switch2-controllers** — Original reverse engineering work
 
 ---
 
-**Document Version:** 1.0  
-**Last Updated:** 2026-07-16  
+**Document Version:** 1.1  
+**Last Updated:** 2026-07-20  
 **Author:** Development Team  
-**Status:** Ready for Phase 1 - Research
+**Status:** Ready for Phase 1 - Research  
+**Changelog:** v1.1 — Added XinHeLianSheng-Pro2-Bridge as primary reference (same ESP32-S3 N16R8 board, proven BLE→USB bridge); added USB identity mode decision table; corrected toolchain dependencies (ESP-IDF, not Pico SDK)
