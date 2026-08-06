@@ -51,6 +51,82 @@ def decodes(data: bytes):
 
 _CACHED_LOCAL_MAC_VALUE = None
 
+# Bluetooth radio (HCI) device interface. Present exactly when Windows has a Bluetooth
+# radio enumerated -- built in or on a dongle.
+GUID_BTHPORT_DEVICE_INTERFACE = "{0850302A-B344-4FDA-9BE9-90576B8D46F0}"
+
+
+def bluetooth_radio_present() -> bool:
+    """True when Windows currently has a Bluetooth radio device.
+
+    ``get_local_mac_value()`` below raises "No more data is available"
+    (ERROR_NO_MORE_ITEMS) both when there is no radio at all and when the Bluetooth stack
+    simply has not finished starting yet, which are very different situations: the first
+    should never be retried, the second always should. Asking PnP directly tells the two
+    apart, so a machine with no dongle stops retrying immediately while a machine whose
+    radio is still warming up at boot keeps its retries.
+
+    Returns True on any unexpected failure -- callers then fall back to their retry loop,
+    which is the safe direction to be wrong in.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import uuid
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("InterfaceClassGuid", GUID),
+                ("Flags", wintypes.DWORD),
+                ("Reserved", ctypes.c_void_p),
+            ]
+
+        value = uuid.UUID(GUID_BTHPORT_DEVICE_INTERFACE.strip("{}"))
+        guid = GUID(value.time_low, value.time_mid, value.time_hi_version,
+                    (ctypes.c_ubyte * 8)(*value.bytes[8:]))
+
+        DIGCF_PRESENT = 0x00000002
+        DIGCF_DEVICEINTERFACE = 0x00000010
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+        setupapi.SetupDiGetClassDevsW.argtypes = [
+            ctypes.POINTER(GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD
+        ]
+        setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+        setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID), wintypes.DWORD,
+            ctypes.POINTER(SP_DEVICE_INTERFACE_DATA)
+        ]
+        setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+        setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+
+        info_set = setupapi.SetupDiGetClassDevsW(
+            ctypes.byref(guid), None, None, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+        if info_set == INVALID_HANDLE_VALUE:
+            return True
+        try:
+            iface = SP_DEVICE_INTERFACE_DATA()
+            iface.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DATA)
+            return bool(setupapi.SetupDiEnumDeviceInterfaces(
+                info_set, None, ctypes.byref(guid), 0, ctypes.byref(iface)))
+        finally:
+            setupapi.SetupDiDestroyDeviceInfoList(info_set)
+    except Exception:
+        return True
+
+
 def convert_mac_string_to_value(mac: str):
     # Handle colons, dashes, and spaces robustly and convert to integer
     cleaned = mac.replace(":", "").replace("-", "").strip()
@@ -159,10 +235,59 @@ def quaternion_from_vectors(v_from, v_to):
     cross = vector_cross(v_from, v_to)
     return quaternion_normalize((s * 0.5, cross[0] * inv_s, cross[1] * inv_s, cross[2] * inv_s))
 
+_IS_PACKAGED_CACHE = None
+
+def is_packaged():
+    """Return True when running from inside an MSIX package (has package identity).
+
+    MSIX-packaged builds behave differently from the standalone GitHub .exe:
+    driver installation is delegated to external download+install, and startup
+    uses a StartupTask instead of the HKCU\\Run registry value (which is
+    virtualized and ineffective inside the package).
+    """
+    global _IS_PACKAGED_CACHE
+    if _IS_PACKAGED_CACHE is not None:
+        return _IS_PACKAGED_CACHE
+    packaged = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        length = ctypes.c_uint32(0)
+        # ERROR_INSUFFICIENT_BUFFER (122) means we have identity; APPMODEL_ERROR_NO_PACKAGE (15700) means none.
+        rc = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
+        packaged = (rc != 15700)
+    except Exception:
+        packaged = False
+    _IS_PACKAGED_CACHE = packaged
+    return packaged
+
+def _set_startup_task(enabled: bool):
+    """Enable/disable startup for MSIX-packaged builds via the manifest StartupTask.
+
+    The TaskId must match the desktop:StartupTask Id declared in AppxManifest.xml.
+    """
+    try:
+        from winrt.windows.applicationmodel import StartupTask, StartupTaskState
+        task = StartupTask.get_async("Switch2ConnectStartup").get()
+        if enabled:
+            if task.state in (StartupTaskState.DISABLED, StartupTaskState.DISABLED_BY_USER):
+                task.request_enable_async().get()
+        else:
+            if task.state == StartupTaskState.ENABLED:
+                task.disable()
+        return True
+    except Exception as e:
+        print(f"Error setting MSIX StartupTask: {e}")
+        return False
+
 def set_startup(enabled: bool):
+    if is_packaged():
+        return _set_startup_task(enabled)
+
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    app_name = "Switch2Controllers"
-    
+    app_name = "Switch 2 Connect"
+    legacy_app_name = "Switch2Controllers"
+
     if hasattr(sys, 'frozen'):
         # Executable path
         app_path = sys.executable
@@ -174,11 +299,16 @@ def set_startup(enabled: bool):
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
         if enabled:
             winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, app_path)
-        else:
             try:
-                winreg.DeleteValue(key, app_name)
+                winreg.DeleteValue(key, legacy_app_name)
             except FileNotFoundError:
                 pass
+        else:
+            for value_name in (app_name, legacy_app_name):
+                try:
+                    winreg.DeleteValue(key, value_name)
+                except FileNotFoundError:
+                    pass
         winreg.CloseKey(key)
         return True
     except Exception as e:

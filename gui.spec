@@ -7,6 +7,7 @@ binaries = []
 if os.path.exists('drivers/dualsense_haptic_native.dll'):
     binaries.append(('drivers/dualsense_haptic_native.dll', 'drivers'))
 hiddenimports = [
+    'driver_install_helper',
     'usbip_server',
     'usbip_dualsense_server',
     'dualsense_descriptors',
@@ -19,12 +20,19 @@ hiddenimports = [
     'comtypes.automation',
     'win32com',
     'win32com.client',
+    'kofi_webview',
+    'webview',
+    'clr',
+    'proxy_tools',
+    'bottle',
 ]
 tmp_ret = collect_all('vgamepad')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('imufusion')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('comtypes')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('webview')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

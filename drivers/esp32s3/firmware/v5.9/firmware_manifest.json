@@ -1,11 +1,12 @@
 ﻿{
-    "packageVersion":  "1.0.0",
-    "firmwareVersion":  "0.12.4",
+    "packageVersion":  "1.2",
+    "firmwareVersion":  "1.2",
     "target":  "esp32s3",
     "flashMode":  "dio",
     "flashFreq":  "80m",
     "flashSize":  "16MB",
     "defaultProfile":  "tinyusb_direct",
+    "releaseNotes":  "tinyusb_direct v1.2 (2026-07-22): Bluedroid production bridge with per-channel latest-only, congestion-aware Audio Haptic playout, shadow_latest capability, and Host latest-only ESP32 input dispatch. Audio-safe rs ownership and non-Audio rd routing remain unchanged.",
     "profiles":  [
                      {
                          "id":  "basic_ble_transport_0_10_5",
@@ -32,23 +33,23 @@
                      {
                          "id":  "tinyusb_direct",
                          "label":  "ESP32-S3 Bluedroid Bridge (production)",
-                         "version":  "0.12.4",
+                         "version":  "1.2",
                          "app":  "esp32s3_bluedroid_bridge.bin",
                          "assets":  [
                                         {
                                             "offset":  "0x0",
-                                            "path":  "v1.0_bluedroid/bootloader.bin",
-                                            "sha256":  "73523d9b9379bf9c76d3d3b1aba645093d5b3b241dedaa612d0d425bccbd505f"
+                                            "path":  "v1.2_bluedroid/bootloader.bin",
+                                            "sha256":  "a182332bf3da19810d8532dc119306cebfd4b76c03debdcfda6f975373face60"
                                         },
                                         {
                                             "offset":  "0x8000",
-                                            "path":  "v1.0_bluedroid/partition-table.bin",
+                                            "path":  "v1.2_bluedroid/partition-table.bin",
                                             "sha256":  "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
                                         },
                                         {
                                             "offset":  "0x10000",
-                                            "path":  "v1.0_bluedroid/esp32s3_bluedroid_bridge.bin",
-                                            "sha256":  "859f32988a2ebee793626b732b7a00ad661742eee4fa18e36bd98dcfe1627bb7"
+                                            "path":  "v1.2_bluedroid/esp32s3_bluedroid_bridge.bin",
+                                            "sha256":  "4bab6eaf21f5fa20b410a2d0baf374db4b38d61be87bb0c017581c141cf95fc9"
                                         }
                                     ]
                      }

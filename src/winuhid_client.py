@@ -21,8 +21,14 @@ import ctypes
 import os
 import sys
 import logging
+import threading
+import time
+_PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 
 logger = logging.getLogger(__name__)
+
+# Built-in diagnostics remain rate-limited below. Never emit one log per native
+# WinUHid callback: doing so would hold the GIL and stall other controllers.
 
 # Load the DLLs
 try:
@@ -460,6 +466,24 @@ def setup_prototypes():
     _winuhid_devs.WinUHidXOneDestroy.argtypes = [ctypes.c_void_p]
     _winuhid_devs.WinUHidXOneDestroy.restype = None
 
+    # Mouse (emulates a Microsoft Precision Mouse unless the preset info overrides
+    # the identifiers). Used by the Joy-Con IR Mouse "Raw Input" mode so that games
+    # reading WM_INPUT see a real HID mouse instead of injected mouse_event calls.
+    _winuhid_devs.WinUHidMouseCreate.argtypes = [ctypes.POINTER(WINUHID_PRESET_DEVICE_INFO)]
+    _winuhid_devs.WinUHidMouseCreate.restype = ctypes.c_void_p
+
+    _winuhid_devs.WinUHidMouseReportMotion.argtypes = [ctypes.c_void_p, ctypes.c_short, ctypes.c_short]
+    _winuhid_devs.WinUHidMouseReportMotion.restype = ctypes.c_bool
+
+    _winuhid_devs.WinUHidMouseReportButton.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_bool]
+    _winuhid_devs.WinUHidMouseReportButton.restype = ctypes.c_bool
+
+    _winuhid_devs.WinUHidMouseReportScroll.argtypes = [ctypes.c_void_p, ctypes.c_short, ctypes.c_bool]
+    _winuhid_devs.WinUHidMouseReportScroll.restype = ctypes.c_bool
+
+    _winuhid_devs.WinUHidMouseDestroy.argtypes = [ctypes.c_void_p]
+    _winuhid_devs.WinUHidMouseDestroy.restype = None
+
 setup_prototypes()
 
 
@@ -499,7 +523,8 @@ class VDS4Gamepad:
 
     def update(self):
         if self.device and _winuhid_devs:
-            _winuhid_devs.WinUHidPS4ReportInput(self.device, ctypes.byref(self.report))
+            return bool(_winuhid_devs.WinUHidPS4ReportInput(self.device, ctypes.byref(self.report)))
+        return False
 
     def close(self):
         if hasattr(self, 'device') and self.device and _winuhid_devs:
@@ -570,7 +595,8 @@ class VDS5Gamepad:
 
     def update(self):
         if self.device and _winuhid_devs:
-            _winuhid_devs.WinUHidPS5ReportInput(self.device, ctypes.byref(self.report))
+            return bool(_winuhid_devs.WinUHidPS5ReportInput(self.device, ctypes.byref(self.report)))
+        return False
 
     def close(self):
         if hasattr(self, 'device') and self.device and _winuhid_devs:
@@ -591,7 +617,20 @@ class VX360Gamepad:
     """Wraps WinUHid Xbox One controller to behave like VX360Gamepad from vgamepad."""
     def __init__(self):
         self.notification_callback = None
+        self.force_feedback_notification_callback = None
         self.report = WINUHID_XONE_INPUT_REPORT()
+        # Phase 1 diagnostic state.  Keep this in the Python wrapper so the
+        # existing two-motor notification contract remains byte-for-byte
+        # unchanged while we capture the Xbox One impulse-trigger values.
+        self._impulse_log_previous = (0, 0, 0, 0)
+        self._impulse_log_started_at = None
+        self._impulse_log_last_at = None
+        self._impulse_log_samples = 0
+        self._impulse_log_sequence = 0
+        self._impulse_log_peak_lt = 0
+        self._impulse_log_peak_rt = 0
+        self._impulse_log_peak_main_l = 0
+        self._impulse_log_peak_main_r = 0
         if _winuhid_devs is not None:
             _winuhid_devs.WinUHidXOneInitializeInputReport(ctypes.byref(self.report))
             self._c_rumble_cb = XONE_RUMBLE_CALLBACK(self._rumble_handler)
@@ -603,19 +642,107 @@ class VX360Gamepad:
             logger.error("WinUHidDevs DLL not loaded")
 
     def _rumble_handler(self, context, left_motor, right_motor, left_trigger, right_trigger):
-        if self.notification_callback:
-            # WinUHid provides motor values as percentages (0-100).
-            # vgamepad expects 0-255.
-            # Convert percentage to 0-255.
-            large_motor = int(left_motor * 2.55)
-            small_motor = int(right_motor * 2.55)
-            self.notification_callback(None, None, large_motor, small_motor, 0, None)
+        # Native WinUHid callback -- runs on the driver's callback thread and holds the
+        # GIL.  Keep it to functional work only; the impulse calibration logging lives in
+        # the rate-limited _log_impulse_diagnostics(); logging every rumble update here
+        # would stall input for every connected controller.
+        # WinUHid XOne supplies all four motors as percentages (0-100).
+        impulse_l = int(left_trigger)
+        impulse_r = int(right_trigger)
+
+        if _PERF_DIAGNOSTICS:
+            self._log_impulse_diagnostics(int(left_motor), int(right_motor), impulse_l, impulse_r)
+
+        # Xbox-capable callers can consume all four motors atomically.  Keep
+        # the legacy two-motor callback as a fallback for existing users.
+        if self.force_feedback_notification_callback:
+            # WinUHid provides motor values as percentages (0-100); vgamepad expects 0-255.
+            self.force_feedback_notification_callback(
+                int(left_motor * 2.55), int(right_motor * 2.55), impulse_l, impulse_r)
+        elif self.notification_callback:
+            self.notification_callback(
+                None, None, int(left_motor * 2.55), int(right_motor * 2.55), 0, None)
+
+    def _log_impulse_diagnostics(self, main_l, main_r, impulse_l, impulse_r):
+        """Rate-limited Xbox impulse-trigger calibration logging.
+
+        Records the raw four-motor values so the gpadtester Low/High calibration can be
+        based on the actual Xbox impulse-trigger magnitudes.
+        """
+        current = (main_l, main_r, impulse_l, impulse_r)
+        impulse_active = impulse_l > 0 or impulse_r > 0
+        was_impulse_active = (
+            self._impulse_log_previous[2] > 0
+            or self._impulse_log_previous[3] > 0
+        )
+        now = time.perf_counter()
+
+        if impulse_active:
+            if not was_impulse_active:
+                self._impulse_log_started_at = now
+                self._impulse_log_last_at = None
+                self._impulse_log_samples = 0
+                self._impulse_log_peak_lt = 0
+                self._impulse_log_peak_rt = 0
+                self._impulse_log_peak_main_l = 0
+                self._impulse_log_peak_main_r = 0
+
+            self._impulse_log_samples += 1
+            self._impulse_log_peak_lt = max(self._impulse_log_peak_lt, impulse_l)
+            self._impulse_log_peak_rt = max(self._impulse_log_peak_rt, impulse_r)
+            self._impulse_log_peak_main_l = max(self._impulse_log_peak_main_l, main_l)
+            self._impulse_log_peak_main_r = max(self._impulse_log_peak_main_r, main_r)
+
+        # Emit only edge/change records. This keeps the native rumble callback
+        # lightweight while retaining every value needed to identify Low/High.
+        if impulse_active or was_impulse_active:
+            if not was_impulse_active:
+                event = "START"
+            elif not impulse_active:
+                event = "STOP"
+            elif current != self._impulse_log_previous:
+                event = "UPDATE"
+            else:
+                event = None
+
+            if event is not None:
+                self._impulse_log_sequence += 1
+                dt_ms = 0.0 if self._impulse_log_last_at is None else (now - self._impulse_log_last_at) * 1000.0
+                logger.info(
+                    "XONE-IMPULSE seq=%d dt=%.1fms main[L=%d R=%d] impulse[LT=%d RT=%d] event=%s",
+                    self._impulse_log_sequence, dt_ms, main_l, main_r,
+                    impulse_l, impulse_r, event,
+                )
+                self._impulse_log_last_at = now
+
+            if was_impulse_active and not impulse_active:
+                duration_ms = 0.0 if self._impulse_log_started_at is None else (now - self._impulse_log_started_at) * 1000.0
+                logger.info(
+                    "XONE-IMPULSE-SUMMARY duration=%.1fms samples=%d peak[LT=%d RT=%d] main_peak[L=%d R=%d]",
+                    duration_ms, self._impulse_log_samples,
+                    self._impulse_log_peak_lt, self._impulse_log_peak_rt,
+                    self._impulse_log_peak_main_l, self._impulse_log_peak_main_r,
+                )
+                self._impulse_log_started_at = None
+
+        self._impulse_log_previous = current
 
     def register_notification(self, callback_function):
         self.notification_callback = callback_function
 
     def unregister_notification(self):
         self.notification_callback = None
+
+    def register_force_feedback_notification(self, callback_function):
+        """Registers an Xbox One-only, atomic four-motor callback.
+
+        Main motors retain the legacy 0-255 representation; impulse motors
+        intentionally retain the native WinUHid 0-100 percentage values.
+        """
+        self.force_feedback_notification_callback = callback_function
+
+    def unregister_force_feedback_notification(self):
+        self.force_feedback_notification_callback = None
 
     def left_trigger(self, val):
         # val is 0-255. WinUHid XOne expects 10-bit LeftTrigger (0-1023).
@@ -625,17 +752,22 @@ class VX360Gamepad:
         # val is 0-255. WinUHid XOne expects 10-bit RightTrigger (0-1023).
         self.report.RightTrigger = int(val * 1023 / 255)
 
+    @staticmethod
+    def _axis_float_to_ushort(val):
+        val = max(-1.0, min(1.0, float(val)))
+        return int((val + 1.0) * 32767.5)
+
     def left_joystick_float(self, x, y):
         # x, y are floats (-1.0 to 1.0)
         # WinUHid XOne expects USHORT (0 to 65535, 32768 is center)
-        self.report.LeftStickX = int((x + 1.0) * 32767.5)
-        self.report.LeftStickY = int((y + 1.0) * 32767.5)
+        self.report.LeftStickX = self._axis_float_to_ushort(x)
+        self.report.LeftStickY = self._axis_float_to_ushort(y)
 
     def right_joystick_float(self, x, y):
         # x, y are floats (-1.0 to 1.0)
         # WinUHid XOne expects USHORT (0 to 65535, 32768 is center)
-        self.report.RightStickX = int((x + 1.0) * 32767.5)
-        self.report.RightStickY = int((y + 1.0) * 32767.5)
+        self.report.RightStickX = self._axis_float_to_ushort(x)
+        self.report.RightStickY = self._axis_float_to_ushort(y)
 
     def set_buttons(self, buttons_mask):
         # Map XInput buttons flags to WINUHID_XONE_INPUT_REPORT bitfields
@@ -665,7 +797,8 @@ class VX360Gamepad:
 
     def update(self):
         if self.device and _winuhid_devs:
-            _winuhid_devs.WinUHidXOneReportInput(self.device, ctypes.byref(self.report))
+            return bool(_winuhid_devs.WinUHidXOneReportInput(self.device, ctypes.byref(self.report)))
+        return False
 
     def close(self):
         if hasattr(self, 'device') and self.device and _winuhid_devs:
@@ -673,9 +806,104 @@ class VX360Gamepad:
             self.device = None
         self._c_rumble_cb = None
         self.notification_callback = None
+        self.force_feedback_notification_callback = None
 
     def __del__(self):
         self.close()
+
+
+class VMouse:
+    """A virtual HID mouse backed by WinUHidDevs.dll.
+
+    Unlike win32api.mouse_event, reports submitted here travel the real HID stack,
+    so applications that read the mouse through Raw Input (WM_INPUT) see them.
+
+    Every method is a no-op when the DLL is missing or device creation failed, so
+    callers can hold one unconditionally and fall back on `device is None`.
+    """
+
+    # WinUHidMouseReportButton takes a *zero-based* index even though the WUHM_BUTTON_*
+    # constants in WinUHidMouse.h are 1-based: the implementation does
+    # `Mouse->Buttons |= 1 << ButtonIndex` and rejects ButtonIndex >= 5.
+    BTN_LEFT = 0
+    BTN_RIGHT = 1
+    BTN_MIDDLE = 2
+    BTN_X1 = 3
+    BTN_X2 = 4
+
+    # Logical min/max of the X/Y fields in the mouse report descriptor.
+    _DELTA_LIMIT = 32767
+
+    def __init__(self, vendor_id=0, product_id=0, version=0, instance_id=None):
+        self.device = None
+        # Motion is submitted from the interpolation thread while buttons and scroll
+        # are submitted from the BLE notification thread; they share one handle.
+        self._lock = threading.Lock()
+        if _winuhid_devs is None:
+            logger.error("Cannot create WinUHid virtual mouse: WinUHidDevs DLL not loaded")
+            return
+        info = WINUHID_PRESET_DEVICE_INFO()
+        # PopulateDeviceInfo requires a vendor id whenever a product id is given, and
+        # a product id whenever a version is given. Leaving all three at 0 keeps the
+        # DLL's built-in identifiers. HardwareIDs is left NULL on purpose: it must be
+        # a REG_MULTI_SZ and c_wchar_p truncates at the first embedded null.
+        info.VendorID = vendor_id
+        info.ProductID = product_id
+        info.VersionNumber = version
+        info.InstanceID = instance_id
+        info.HardwareIDs = None
+        device = _winuhid_devs.WinUHidMouseCreate(ctypes.byref(info))
+        if not device:
+            logger.error(
+                "Failed to create WinUHid virtual mouse (VID %04x PID %04x): error %s",
+                vendor_id, product_id, ctypes.GetLastError())
+            return
+        self.device = device
+
+    def report_motion(self, dx, dy):
+        if not self.device or _winuhid_devs is None:
+            return False
+        limit = self._DELTA_LIMIT
+        dx = max(-limit, min(limit, int(dx)))
+        dy = max(-limit, min(limit, int(dy)))
+        with self._lock:
+            if not self.device:
+                return False
+            return bool(_winuhid_devs.WinUHidMouseReportMotion(self.device, dx, dy))
+
+    def report_button(self, button_index, down):
+        if not self.device or _winuhid_devs is None:
+            return False
+        with self._lock:
+            if not self.device:
+                return False
+            return bool(_winuhid_devs.WinUHidMouseReportButton(self.device, int(button_index), bool(down)))
+
+    def report_scroll(self, value, horizontal=False):
+        """Scroll in units of 1/120th of a detent - the same scale as WHEEL_DELTA."""
+        if not self.device or _winuhid_devs is None:
+            return False
+        limit = self._DELTA_LIMIT
+        value = max(-limit, min(limit, int(value)))
+        if value == 0:
+            return True
+        with self._lock:
+            if not self.device:
+                return False
+            return bool(_winuhid_devs.WinUHidMouseReportScroll(self.device, value, bool(horizontal)))
+
+    def close(self):
+        with self._lock:
+            device = getattr(self, 'device', None)
+            self.device = None
+        if device and _winuhid_devs:
+            _winuhid_devs.WinUHidMouseDestroy(device)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 

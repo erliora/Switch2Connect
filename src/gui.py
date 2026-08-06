@@ -18,11 +18,20 @@
 # Electronic Mail: tommyw9318@gmail.com
 
 import sys
-import tempfile, os
-with open(os.path.join(tempfile.gettempdir(), "argv_test.log"), "w") as f:
-    f.write(str(sys.argv) + "\n")
+import os
+
+# The Ko-fi popup runs as a child of this same executable. Dispatching here,
+# before the heavy imports below, keeps the child from loading the controller
+# stack, numpy, pystray and PIL - none of which it uses. Measured on a warm
+# cache: ~650 ms of process start-up down to ~320 ms.
+if __name__ == "__main__" and "--show-kofi" in sys.argv:
+    from kofi_webview import main as _kofi_main
+    _kofi_main(sys.argv[1:])
+    sys.exit(0)
+
 import queue
 import time
+import json
 import webbrowser
 import threading
 import tkinter as tk
@@ -34,7 +43,8 @@ import asyncio
 import os
 import re
 import ctypes
-from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID, controller_calibration_keys, normalize_calibration_key
+import uuid
+from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID, PRO_CONTROLLER2_PID, CONTROLER_NAMES, controller_calibration_keys, normalize_calibration_key
 from discoverer import (
     start_discoverer,
     set_shutting_down,
@@ -43,7 +53,7 @@ from discoverer import (
     request_wired_rescan,
     set_wired_auto_scan_enabled,
 )
-from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs
+from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs, packaged_winuhid_available, refresh_packaged_winuhid_capability
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
@@ -55,13 +65,34 @@ from PIL import Image, ImageTk
 import win32gui
 import win32con
 from ctypes import wintypes
+from driver_install_helper import (
+    HIDHIDE_HEALTHY,
+    HIDHIDE_PARTIAL,
+    HIDHIDE_UNKNOWN,
+    USBIP_HEALTHY,
+    USBIP_PARTIAL,
+    USBIP_UNKNOWN,
+    VIGEMBUS_ABSENT,
+    VIGEMBUS_HEALTHY,
+    VIGEMBUS_PARTIAL,
+    VIGEMBUS_UNKNOWN,
+    WINUHID_ABSENT,
+    WINUHID_HEALTHY,
+    WINUHID_PARTIAL,
+    WINUHID_UNKNOWN,
+    invalidate_driver_status_cache,
+    get_hidhide_status,
+    get_usbip_status,
+    get_winuhid_status,
+    get_vigembus_status,
+)
 
-print("Switch2Connect  Copyright (C) 2026  TommyWabg")
+print("Switch 2 Connect  Copyright (C) 2026  TommyWabg")
 print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.")
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v0.12.10"
+APP_VERSION = "v2.1"
 
 def _set_current_thread_priority(level):
     try:
@@ -90,6 +121,49 @@ class SHELLEXECUTEINFOW(ctypes.Structure):
         ("hProcess", wintypes.HANDLE),
     ]
 
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+    @classmethod
+    def from_string(cls, value):
+        parsed = uuid.UUID(str(value).strip("{}"))
+        return cls.from_buffer_copy(parsed.bytes_le)
+
+
+class DEV_BROADCAST_HDR(ctypes.Structure):
+    _fields_ = [
+        ("dbch_size", wintypes.DWORD),
+        ("dbch_devicetype", wintypes.DWORD),
+        ("dbch_reserved", wintypes.DWORD),
+    ]
+
+
+class DEV_BROADCAST_DEVICEINTERFACE_W(ctypes.Structure):
+    _fields_ = [
+        ("dbcc_size", wintypes.DWORD),
+        ("dbcc_devicetype", wintypes.DWORD),
+        ("dbcc_reserved", wintypes.DWORD),
+        ("dbcc_classguid", GUID),
+        ("dbcc_name", wintypes.WCHAR * 1),
+    ]
+
 # Explicitly set types for Win32 API to ensure compatibility
 ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
 ctypes.windll.shell32.ShellExecuteExW.restype = wintypes.BOOL
@@ -99,6 +173,26 @@ ctypes.windll.kernel32.WaitForSingleObject.restype = wintypes.DWORD
 
 ctypes.windll.kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 ctypes.windll.kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+ctypes.windll.user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+ctypes.windll.user32.GetWindowPlacement.restype = wintypes.BOOL
+ctypes.windll.user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+ctypes.windll.user32.GetAncestor.restype = wintypes.HWND
+ctypes.windll.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+ctypes.windll.user32.GetWindowRect.restype = wintypes.BOOL
+ctypes.windll.user32.IsIconic.argtypes = [wintypes.HWND]
+ctypes.windll.user32.IsIconic.restype = wintypes.BOOL
+ctypes.windll.user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, wintypes.UINT,
+]
+ctypes.windll.user32.SetWindowPos.restype = wintypes.BOOL
+ctypes.windll.user32.RegisterDeviceNotificationW.argtypes = [
+    wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+]
+ctypes.windll.user32.RegisterDeviceNotificationW.restype = wintypes.HANDLE
+ctypes.windll.user32.UnregisterDeviceNotification.argtypes = [wintypes.HANDLE]
+ctypes.windll.user32.UnregisterDeviceNotification.restype = wintypes.BOOL
 
 ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
@@ -146,166 +240,152 @@ def get_exe_display_name(path):
     return os.path.splitext(os.path.basename(path))[0] or "Choose App"
 
 def check_driver_registry():
-    import winreg
-    for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
-        try:
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver",
-                0,
-                sam
-            )
-            winreg.CloseKey(key)
-            return True
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-    return False
+    return bool(get_winuhid_status(use_cache=True).registry_exists)
 
 def check_driver_pnputil():
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        if result.returncode == 0 and "root\\winuhid" in result.stdout.lower():
-            return True
-    except Exception as e:
-        logger.error(f"Error checking driver installation via pnputil: {e}")
-    return False
+    return bool(get_winuhid_status(use_cache=True).present_instances)
 
 def is_driver_installed():
-    return check_driver_registry() or check_driver_pnputil()
+    return get_winuhid_status(use_cache=True).installed
 
-def check_vigembus_registry():
-    import winreg
-    for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
+
+def verify_winuhid_runtime(attempts=10, delay_seconds=0.5):
+    """Create, submit one neutral report to, and destroy a temporary WinUHid pad."""
+    import winuhid_client
+    for attempt in range(max(1, attempts)):
+        pad = None
         try:
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SYSTEM\CurrentControlSet\Services\ViGEmBus",
-                0,
-                sam
-            )
-            winreg.CloseKey(key)
-            return True
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-            
-    # Also check uninstall keys
-    paths = [
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-        r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-    ]
-    for path in paths:
-        for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
-            try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, sam)
-                info = winreg.QueryInfoKey(key)
-                for i in range(info[0]):
-                    try:
-                        subkey_name = winreg.EnumKey(key, i)
-                        if subkey_name == "{966606F3-2745-49E9-BF15-5C3EAA4E9077}":
-                            winreg.CloseKey(key)
-                            return True
-                        subkey = winreg.OpenKey(key, subkey_name)
-                        try:
-                            val, _ = winreg.QueryValueEx(subkey, "DisplayName")
-                            if "vigem" in str(val).lower() or "virtual gamepad emulation" in str(val).lower():
-                                winreg.CloseKey(subkey)
-                                winreg.CloseKey(key)
-                                return True
-                        except:
-                            pass
-                        winreg.CloseKey(subkey)
-                    except:
-                        pass
-                winreg.CloseKey(key)
-            except:
-                pass
-    return False
-
-def check_vigembus_pnputil():
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["pnputil", "/enum-devices", "/deviceid", "Root\\ViGEmBus"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        if result.returncode == 0 and "root\\vigembus" in result.stdout.lower():
-            return True
-            
-        result = subprocess.run(
-            ["pnputil", "/enum-devices", "/deviceid", "Nefarius\\ViGEmBus\\Gen1"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        if result.returncode == 0 and "vigembus" in result.stdout.lower():
-            return True
-    except Exception as e:
-        logger.error(f"Error checking ViGEmBus installation via pnputil enum-devices: {e}")
-
-    try:
-        result = subprocess.run(
-            ["pnputil", "/enum-drivers"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        if result.returncode == 0:
-            if "vigembus" in result.stdout.lower() or "nefarius" in result.stdout.lower():
+            pad = winuhid_client.VX360Gamepad()
+            if getattr(pad, "device", None) and pad.update() is not False:
                 return True
-    except Exception as e:
-        logger.error(f"Error checking ViGEmBus installation via pnputil enum-drivers: {e}")
-        
+        except Exception as exc:
+            logger.debug("WinUHid runtime smoke test attempt %d failed: %s", attempt + 1, exc)
+        finally:
+            if pad is not None:
+                try:
+                    pad.close()
+                except Exception:
+                    pass
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    logger.error("WinUHid runtime smoke test failed after %d attempts", attempts)
     return False
 
-def is_vigembus_installed():
-    return check_vigembus_registry() or check_vigembus_pnputil()
+def hidhide_service_state():
+    """HidHide service registration: True / False / None (undeterminable).
 
-def is_pro2_winusb_bound():
-    """True when the Pro Controller 2 vendor interface (MI_01) is bound to WinUSB.
-
-    On Windows 8+ the controller's own MS OS descriptor makes Windows auto-install
-    WinUSB, so this is normally always True and needs no user action. It is used only
-    as an internal safety-net signal (to warn if activation might fail); there is no
-    WinUSB install/uninstall UI. Uses a fast registry read (no PowerShell subprocess).
+    Never raises. None must not be persisted as "not installed" - a registry key
+    that exists but cannot be read would otherwise write a wrong answer into
+    config.yaml that survives restarts.
     """
     try:
-        import winreg
-    except Exception:
-        return False
-    base = r"SYSTEM\CurrentControlSet\Enum\USB\VID_057E&PID_2069&MI_01"
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as key:
-            index = 0
-            while True:
-                try:
-                    instance = winreg.EnumKey(key, index)
-                    index += 1
-                except OSError:
-                    break
-                if "SWITCH2EMU" in instance.upper():
-                    continue
-                try:
-                    with winreg.OpenKey(key, instance) as inst_key:
-                        service = str(winreg.QueryValueEx(inst_key, "Service")[0]).upper()
-                    if service == "WINUSB":
-                        return True
-                except OSError:
-                    continue
-    except OSError:
-        pass
+        import hidhide
+        return hidhide.service_state()
+    except Exception as exc:
+        logger.debug("HidHide state could not be read: %s", exc)
+        return None
+
+
+def removal_verified(status, runtime_probe):
+    """True when a driver can be considered gone.
+
+    Normally every layer must read absent. When the layers cannot be read at all
+    (older pnputil), fall back to the runtime probe: if a client can no longer be
+    created, the driver is effectively removed.
+    """
+    if status.absent:
+        return True
+    if status.unknown:
+        return not runtime_probe(attempts=2)
     return False
+
+
+def check_vigembus_registry():
+    status = get_vigembus_status(use_cache=True)
+    return bool(status.service_exists) or bool(status.msi_entries)
+
+def check_vigembus_pnputil():
+    status = get_vigembus_status(use_cache=True)
+    return bool(status.bound_instances and status.driver_packages)
+
+def is_vigembus_installed():
+    return get_vigembus_status(use_cache=True).installed
+
+
+def verify_vigembus_runtime(attempts=10, delay_seconds=0.5):
+    for attempt in range(max(1, attempts)):
+        bus = None
+        try:
+            from virtual_controller import get_vigem
+            vigem = get_vigem()
+            bus = vigem.win.virtual_gamepad.VBus()
+            return True
+        except Exception as exc:
+            logger.debug("ViGEmBus runtime smoke test attempt %d failed: %s", attempt + 1, exc)
+        finally:
+            if bus is not None:
+                try:
+                    del bus
+                except Exception:
+                    pass
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return False
+
+
+def verify_vigembus_ready(attempts=12, delay_seconds=0.5):
+    """Wait for both PnP/service health and an actual client connection.
+
+    When the PnP layers cannot be determined (pnputil without /properties), the
+    runtime connection alone decides - it is what the app actually depends on.
+    """
+    for attempt in range(max(1, attempts)):
+        invalidate_driver_status_cache("vigembus")
+        status = get_vigembus_status()
+        if (status.installed or status.unknown) and verify_vigembus_runtime(attempts=1):
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return False
+
+# Wired pads the USB watcher can adopt, mirrored here so the WM_DEVICECHANGE filter
+# stays in sync without importing usb_hid_controller (and hidapi) at GUI import time.
+try:
+    from usb_hid_controller import WIRED_USB_PIDS as WIRED_USB_DEVICE_PIDS
+except Exception:
+    WIRED_USB_DEVICE_PIDS = (0x2069, 0x2073)
+
+
+def wired_controller_label(product_ids, sentence=False):
+    """Name the wired pad(s) currently connected, for UI text.
+
+    Every wired string used to be hardcoded to "Pro Controller 2", so plugging in a
+    GameCube controller produced buttons and prompts naming the wrong device. Names
+    come from CONTROLER_NAMES so wired text matches what the rest of the app calls
+    the same pad.
+
+    ``sentence`` returns a subject phrase to open a sentence with ("A wired NSO
+    GameCube Controller"), rather than the bare button label.
+    """
+    ids = [pid for pid in dict.fromkeys(product_ids or ()) if pid in CONTROLER_NAMES]
+    if len(ids) > 1:
+        # Mixed set (e.g. a Pro Controller 2 and a GameCube pad): naming one of them
+        # would be wrong, so stay generic rather than pick a winner.
+        return "Wired controllers were" if sentence else "Wired Controllers"
+    if not ids:
+        return "A wired controller was" if sentence else "Wired Controller"
+    name = CONTROLER_NAMES[ids[0]]
+    if sentence:
+        return f"{'An' if name[0] in 'AEIOU' else 'A'} wired {name} was"
+    return f"Wired {name}"
+
+
+# No WinUSB status helper lives here any more. Nintendo's pads advertise the
+# MS_COMP_WINUSB compatible id, so Windows binds its own inbox winusb.inf with no
+# user action. The USB transport layer uses it automatically when available and
+# falls back to HID without exposing a manual route selector. Input always remains
+# on the HID interface. usb_hid_controller.winusb_binding_state() remains as the
+# single implementation used for connection diagnostics.
 
 logger = logging.getLogger(__name__)
 
@@ -684,9 +764,21 @@ class PowerListener:
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
 class WiredDeviceChangeListener:
+    """Watches for wired controller arrival/removal, and for Bluetooth radios.
+
+    Both live on one hidden window: RegisterDeviceNotificationW can be called more than
+    once for the same hwnd, and the two interfaces are told apart in _wndproc. The radio
+    notification lets the wireless route sit idle until a radio actually appears instead
+    of retrying on a timer.
+    """
+
     WM_DEVICECHANGE = 0x0219
     DBT_DEVICEARRIVAL = 0x8000
     DBT_DEVICEREMOVECOMPLETE = 0x8004
+    DBT_DEVTYP_DEVICEINTERFACE = 0x00000005
+    DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
+    HID_INTERFACE_GUID = "{4D1E55B2-F16F-11CF-88CB-001111000030}"
+    BLUETOOTH_RADIO_GUID = "{0850302A-B344-4FDA-9BE9-90576B8D46F0}"
 
     def __init__(self, event_queue):
         self.event_queue = event_queue
@@ -694,6 +786,8 @@ class WiredDeviceChangeListener:
         self.thread = None
         self._stop_event = threading.Event()
         self._class_name = f"Switch2WiredDeviceChangeWindow_{id(self)}"
+        self.notification_handle = None
+        self.bluetooth_notification_handle = None
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -724,10 +818,50 @@ class WiredDeviceChangeListener:
         try:
             class_atom = win32gui.RegisterClass(wc)
             self.hwnd = win32gui.CreateWindow(class_atom, self._class_name, 0, 0, 0, 0, 0, 0, 0, hinstance, None)
+            device_filter = DEV_BROADCAST_DEVICEINTERFACE_W()
+            device_filter.dbcc_size = ctypes.sizeof(DEV_BROADCAST_DEVICEINTERFACE_W)
+            device_filter.dbcc_devicetype = self.DBT_DEVTYP_DEVICEINTERFACE
+            device_filter.dbcc_classguid = GUID.from_string(self.HID_INTERFACE_GUID)
+            self.notification_handle = ctypes.windll.user32.RegisterDeviceNotificationW(
+                self.hwnd,
+                ctypes.byref(device_filter),
+                self.DEVICE_NOTIFY_WINDOW_HANDLE,
+            )
+            if not self.notification_handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            logger.info("Wired HID device notification registered.")
+
+            # Second registration on the same window for Bluetooth radios.
+            try:
+                radio_filter = DEV_BROADCAST_DEVICEINTERFACE_W()
+                radio_filter.dbcc_size = ctypes.sizeof(DEV_BROADCAST_DEVICEINTERFACE_W)
+                radio_filter.dbcc_devicetype = self.DBT_DEVTYP_DEVICEINTERFACE
+                radio_filter.dbcc_classguid = GUID.from_string(self.BLUETOOTH_RADIO_GUID)
+                self.bluetooth_notification_handle = ctypes.windll.user32.RegisterDeviceNotificationW(
+                    self.hwnd,
+                    ctypes.byref(radio_filter),
+                    self.DEVICE_NOTIFY_WINDOW_HANDLE,
+                )
+                if self.bluetooth_notification_handle:
+                    logger.info("Bluetooth radio device notification registered.")
+                else:
+                    logger.warning("Bluetooth radio notification could not be registered; "
+                                   "the wireless route will fall back to its periodic check.")
+            except Exception as e:
+                logger.warning("Bluetooth radio notification setup failed: %s", e)
+
             win32gui.PumpMessages()
         except Exception as e:
-            logger.debug("Wired device change listener failed: %s", e)
+            logger.error("Wired device change listener failed: %s", e)
         finally:
+            for attr in ("notification_handle", "bluetooth_notification_handle"):
+                handle = getattr(self, attr, None)
+                if handle:
+                    try:
+                        ctypes.windll.user32.UnregisterDeviceNotification(handle)
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
             self.hwnd = None
             try:
                 win32gui.UnregisterClass(self._class_name, hinstance)
@@ -741,11 +875,36 @@ class WiredDeviceChangeListener:
                 reason = "device_arrival"
             elif int(wparam) == self.DBT_DEVICEREMOVECOMPLETE:
                 reason = "device_removal"
-            if reason:
+            path = None
+            if reason and lparam:
+                try:
+                    header = ctypes.cast(
+                        lparam, ctypes.POINTER(DEV_BROADCAST_HDR)).contents
+                    if header.dbch_devicetype == self.DBT_DEVTYP_DEVICEINTERFACE:
+                        path = ctypes.wstring_at(
+                            lparam + DEV_BROADCAST_DEVICEINTERFACE_W.dbcc_name.offset)
+                except Exception:
+                    path = None
+            target_path = (path or "").upper()
+            if reason and any(f"VID_057E&PID_{pid:04X}" in target_path
+                              for pid in WIRED_USB_DEVICE_PIDS):
                 try:
                     self.event_queue.put_nowait({
+                        "kind": "wired",
                         "reason": reason,
-                        "path": None,
+                        "path": path,
+                        "timestamp": time.time(),
+                    })
+                except Exception:
+                    pass
+            elif reason and self.BLUETOOTH_RADIO_GUID.strip("{}") in target_path:
+                # A Bluetooth radio came or went. The wireless route is parked waiting for
+                # exactly this instead of retrying an adapter that is not there.
+                try:
+                    self.event_queue.put_nowait({
+                        "kind": "bluetooth_radio",
+                        "reason": reason,
+                        "path": path,
                         "timestamp": time.time(),
                     })
                 except Exception:
@@ -769,6 +928,116 @@ player_number_bg_color = "#2D2D2D"
 highlight_color = "#00C3E3"
 text_color = "#FFFFFF"
 button_gray = "#4B4B4B"
+
+# Top-level config.yaml keys that describe *this* machine rather than the user's
+# preferences.  A config file imported from another PC must never overwrite them
+# or the local driver/window state would be corrupted.  Calibration data is
+# intentionally NOT in this list - it travels with the exported settings.
+MACHINE_LOCAL_CONFIG_KEYS = frozenset({
+    "driver_installed",
+    "vigembus_installed",
+    "hidhide_installed",
+    "hidhide_install_prompt_suppressed",
+    "window_width",
+    "window_height",
+    "window_x",
+    "window_y",
+    "ui_scale",
+    "controller_fast_cache",
+    "controller_fast_cache_entries",
+    "winrt_cached_services",
+})
+
+# Everything bound to a specific physical controller (calibration blobs plus every
+# section keyed by a controller MAC), gated by the "Import/Export Controller Related
+# Data" checkbox in the profile import/export dialogs.
+CONTROLLER_RELATED_CONFIG_KEYS = frozenset({
+    "calibration_data",
+    "joystick_calibration_data",
+    "mag_calibration_data",
+    "gc_trigger_calibration_data",
+    "controller_calibration_aliases",
+    "cemuhook_mac_to_pad",
+    "merged_gyro_side",
+    "joycon_hold_mode",
+    "controller_fast_cache_entries",
+    "gyro_bias_l",
+    "gyro_bias_r",
+    "stick_r_bias",
+})
+
+# Only the MAC-keyed sections decide whether the checkbox is worth showing; the bias
+# values always exist, so they would make it visible even with no controller data.
+CONTROLLER_RELATED_PRESENCE_KEYS = (
+    "calibration_data",
+    "joystick_calibration_data",
+    "mag_calibration_data",
+    "gc_trigger_calibration_data",
+    "controller_calibration_aliases",
+    "cemuhook_mac_to_pad",
+    "merged_gyro_side",
+    "joycon_hold_mode",
+    "controller_fast_cache_entries",
+)
+
+# ``joycon_hold_mode`` is keyed by controller address and appears both directly on a
+# profile-shaped mapping and inside each of its emulation-mode category dicts.
+CONTROLLER_RELATED_NESTED_KEYS = ("joycon_hold_mode",)
+
+
+def strip_controller_related_from_profile(profile):
+    """Empty the MAC-keyed entries inside one profile-shaped mapping."""
+    if not isinstance(profile, dict):
+        return
+    for key in CONTROLLER_RELATED_NESTED_KEYS:
+        if isinstance(profile.get(key), dict):
+            profile[key] = {}
+        for value in profile.values():
+            if isinstance(value, dict) and isinstance(value.get(key), dict):
+                value[key] = {}
+
+
+def strip_controller_related(config_data):
+    """Remove every controller-bound entry from a whole config mapping.
+
+    Covers the top-level MAC-keyed blobs, the per-profile category dicts and the
+    legacy ``button_remaps`` block, which is profile-shaped and still carries
+    ``joycon_hold_mode`` entries keyed by controller address.
+    """
+    if not isinstance(config_data, dict):
+        return
+    for key in CONTROLLER_RELATED_CONFIG_KEYS:
+        config_data.pop(key, None)
+    strip_controller_related_from_profile(config_data.get("button_remaps"))
+    profiles = config_data.get("profiles")
+    if isinstance(profiles, dict):
+        for profile_data in profiles.values():
+            strip_controller_related_from_profile(profile_data)
+
+
+def _profile_has_controller_related_data(profile):
+    if not isinstance(profile, dict):
+        return False
+    for key in CONTROLLER_RELATED_NESTED_KEYS:
+        if profile.get(key):
+            return True
+        if any(isinstance(value, dict) and value.get(key) for value in profile.values()):
+            return True
+    return False
+
+
+def has_controller_related_data(data):
+    """True when ``data`` (a config mapping) carries controller-bound entries."""
+    if not isinstance(data, dict):
+        return False
+    if any(data.get(key) for key in CONTROLLER_RELATED_PRESENCE_KEYS):
+        return True
+    if _profile_has_controller_related_data(data.get("button_remaps")):
+        return True
+    profiles = data.get("profiles")
+    if isinstance(profiles, dict):
+        return any(_profile_has_controller_related_data(p) for p in profiles.values())
+    return False
 
 CONTROLLER_UPDATED_EVENT = '<<ControllersUpdated>>'
 pending_merge_vc_index = None
@@ -853,11 +1122,12 @@ class BackButtonSelector(tk.Button):
     code relies on: get()/set() plus a <<ComboboxSelected>> event fired when the user
     picks an option, so on_combo_selected and the refresh paths keep working unchanged."""
 
-    def __init__(self, parent, gui, font=None, auto_fit=True):
+    def __init__(self, parent, gui, font=None, auto_fit=True, display_overrides=None):
         self._gui = gui
         self._value = "Default"
         self._font = font or scale_font(("Arial", 11, "bold"))
         self._auto_fit = auto_fit
+        self._display_overrides = display_overrides or {}
         # Width auto-fits each label so it is never clipped, but never shrinks below the
         # width of the "Default" label. tk.Button width is in character units, so both the
         # minimum and the per-label widths are derived from the font's character width.
@@ -888,9 +1158,11 @@ class BackButtonSelector(tk.Button):
     def get(self):
         return self._value
 
+    def display_label(self, value):
+        return self._display_overrides.get(value, back_button_label(value))
+
     def set(self, value):
-        from config import back_button_label
-        label = back_button_label(value)
+        label = self.display_label(value)
         self._value = value
         if self._auto_fit:
             self.config(text=label, width=max(self._min_chars, self._fit_chars(label)))
@@ -1077,13 +1349,13 @@ class PlayerInfoBlock:
             vib = VibrationData(lf_amp=800, hf_amp=800)
             off = VibrationData(lf_amp=0, hf_amp=0)
             for controller in self.current_vc.controllers:
-                asyncio.run_coroutine_threadsafe(controller.set_vibration(vib, vib, vib, ignore_freq_scaling=True), self.current_vc.loop)
+                asyncio.run_coroutine_threadsafe(controller.set_vibration(vib, vib, vib, ignore_freq_scaling=True, pair_sustain=False), self.current_vc.loop)
                 self.parent.after(100, lambda c=controller, loop=self.current_vc.loop, o=off: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True, pair_sustain=False), loop))
                 self.parent.after(200, lambda c=controller, loop=self.current_vc.loop, v=vib: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(v, v, v, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(v, v, v, ignore_freq_scaling=True, pair_sustain=False), loop))
                 self.parent.after(300, lambda c=controller, loop=self.current_vc.loop, o=off: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True, pair_sustain=False), loop))
             
             # Brief UI feedback (consistent size)
             if getattr(self, 'vibrate_frame', None):
@@ -1109,12 +1381,6 @@ class PlayerInfoBlock:
             djg_enabled = getattr(CONFIG, "djg_enabled", False)
             djg_mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
 
-            if djg_enabled and djg_mode == "Direct Merge":
-                for c in getattr(self.current_vc, "controllers", []):
-                    c.gyro_active = True
-                self.window.force_refresh_player_slots()
-                return
-            
             if djg_enabled and djg_mode != "Switch Gyro Side":
                 if val == "Left":
                     self.current_vc.djg_left_active = not getattr(self.current_vc, 'djg_left_active', True)
@@ -1312,10 +1578,17 @@ class PlayerInfoBlock:
                 else: widget.place_forget()
 
     def get_image_for_battery_level(self, controller: Controller):
-        if controller.battery_voltage is None: return self.battery_l
+        # No accepted input report yet is an unknown state, not low battery.
+        # Return None so a reconnect cannot retain a stale icon from a previous
+        # controller in this player slot.
+        if controller.battery_voltage is None: return None
         if controller.battery_voltage > 3.25: return self.battery_h
         if controller.battery_voltage > 3.125: return self.battery_m
         return self.battery_l
+
+    def _set_battery_image(self, label, controller: Controller):
+        image = self.get_image_for_battery_level(controller)
+        label.config(image="" if image is None else image)
 
     def displayControllersInfo(self, virtualController : VirtualController):
         self.current_vc = virtualController
@@ -1346,7 +1619,7 @@ class PlayerInfoBlock:
         if virtualController.is_single():
             if not getattr(self, 'battery_label', None): self.battery_label = tk.Label(self.battery_frame, bg=block_color)
             self.battery_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
-            if virtualController.controllers: self.battery_label.config(image=self.get_image_for_battery_level(virtualController.controllers[0]))
+            if virtualController.controllers: self._set_battery_image(self.battery_label, virtualController.controllers[0])
             if getattr(self, 'battery_label2', None): self.battery_label2.place_forget()
 
             if getattr(self, 'mag_frame_l', None): self.mag_frame_l.place_forget()
@@ -1374,9 +1647,9 @@ class PlayerInfoBlock:
             if not getattr(self, 'battery_label', None): self.battery_label = tk.Label(self.battery_frame, bg=block_color)
             if not getattr(self, 'battery_label2', None): self.battery_label2 = tk.Label(self.battery_frame, bg=block_color)
             self.battery_label.place(relx=0.4, rely=0.5, anchor=tk.CENTER)
-            if len(virtualController.controllers) > 0: self.battery_label.config(image=self.get_image_for_battery_level(virtualController.controllers[0]))
+            if len(virtualController.controllers) > 0: self._set_battery_image(self.battery_label, virtualController.controllers[0])
             self.battery_label2.place(relx=0.6, rely=0.5, anchor=tk.CENTER)
-            if len(virtualController.controllers) > 1: self.battery_label2.config(image=self.get_image_for_battery_level(virtualController.controllers[1]))
+            if len(virtualController.controllers) > 1: self._set_battery_image(self.battery_label2, virtualController.controllers[1])
 
             if getattr(self, 'mag_frame_single', None): self.mag_frame_single.place_forget()
 
@@ -1440,10 +1713,7 @@ class PlayerInfoBlock:
     
                 self.gyro_frame_l.place(relx=0.04, rely=0.5, anchor=tk.W)
                 self.gyro_frame_r.place(relx=0.96, rely=0.5, anchor=tk.E)
-                if getattr(CONFIG, "djg_enabled", False) and getattr(CONFIG, "djg_mode", "Single Side Toggle") == "Direct Merge":
-                    self.gyro_frame_l.config(bg=highlight_color)
-                    self.gyro_frame_r.config(bg=highlight_color)
-                elif getattr(CONFIG, "djg_enabled", False) and getattr(CONFIG, "djg_mode", "Single Side Toggle") != "Switch Gyro Side":
+                if getattr(CONFIG, "djg_enabled", False) and getattr(CONFIG, "djg_mode", "Single Side Toggle") != "Switch Gyro Side":
                     self.gyro_frame_l.config(bg=highlight_color if getattr(virtualController, 'djg_left_active', True) else button_gray)
                     self.gyro_frame_r.config(bg=highlight_color if getattr(virtualController, 'djg_right_active', True) else button_gray)
                 elif virtualController.active_gyro_side == "Left":
@@ -2072,10 +2342,12 @@ class ControllerWindow:
         self.esp32s3_detected = False
         # Wired USB Pro Controller 2 detection (drives the HidHide button visibility).
         self.wired_pro2_detected = False
+        # PIDs of the wired pads currently connected, so every wired label names the
+        # controller actually plugged in rather than assuming a Pro Controller 2.
+        self.wired_controller_pids = []
         self._hidhide_installed_cached = False
         self._wired_pro2_refresh_running = False
         self._wired_pro2_prompt_shown = False
-        self._winusb_warn_shown = False
         self.wired_device_event_queue = queue.Queue()
         self.wired_device_listener = WiredDeviceChangeListener(self.wired_device_event_queue)
         self._wired_device_change_after_id = None
@@ -2104,14 +2376,159 @@ class ControllerWindow:
         utils.force_ui_update_callback = self.force_refresh_player_slots
 
     def center_window_on_root(self, window, width, height):
-        self.root.update_idletasks()
-        rx = self.root.winfo_x()
-        ry = self.root.winfo_y()
-        rw = self.root.winfo_width()
-        rh = self.root.winfo_height()
-        x = rx + (rw - width) // 2
-        y = ry + (rh - height) // 2
-        window.geometry(f"{width}x{height}+{x}+{y}")
+        """Center a child window over the main window in screen coordinates.
+
+        Tk's ``winfo_x/y`` can be relative to the window-manager frame and a new
+        Toplevel may be repositioned again when it is first mapped.  Driver
+        install/uninstall dialogs are especially likely to hit that race because
+        they are created immediately before an elevated process is launched.
+        Use root screen coordinates, then repeat the placement after mapping.
+        """
+        width = max(1, int(width))
+        height = max(1, int(height))
+        anchor = {"x": None, "y": None}
+        pixel_anchor = {"x": None, "y": None}
+
+        def top_level_hwnd(widget):
+            try:
+                hwnd = widget.winfo_id()
+                root_hwnd = ctypes.windll.user32.GetAncestor(hwnd, 2)  # GA_ROOT
+                return root_hwnd or hwnd
+            except (tk.TclError, AttributeError, OSError):
+                return None
+
+        def capture_physical_root_center():
+            """Return the main-window center in Win32 physical screen pixels."""
+            hwnd = top_level_hwnd(self.root)
+            rect = wintypes.RECT()
+            try:
+                valid = (
+                    hwnd and
+                    not ctypes.windll.user32.IsIconic(hwnd) and
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)) and
+                    rect.right > rect.left and rect.bottom > rect.top and
+                    rect.left > -10000 and rect.top > -10000
+                )
+                if valid:
+                    center = ((rect.left + rect.right) // 2,
+                              (rect.top + rect.bottom) // 2)
+                    self._last_main_window_center_px = center
+                    return center
+            except (AttributeError, OSError):
+                pass
+            return getattr(self, "_last_main_window_center_px", None)
+
+        def place():
+            try:
+                if not window.winfo_exists() or not self.root.winfo_exists():
+                    return
+                self.root.update_idletasks()
+                window.update_idletasks()
+
+                if pixel_anchor["x"] is None:
+                    physical_center = capture_physical_root_center()
+                    if physical_center:
+                        pixel_anchor["x"], pixel_anchor["y"] = physical_center
+
+                # Capture the main-window centre once, before an elevation request
+                # can temporarily minimize/deactivate it. During the UAC transition
+                # Windows may report coordinates around -32000; recalculating from
+                # those values moved the progress window to the desktop's top-left.
+                if anchor["x"] is None:
+                    rx = self.root.winfo_rootx()
+                    ry = self.root.winfo_rooty()
+                    rw = max(1, self.root.winfo_width())
+                    rh = max(1, self.root.winfo_height())
+                    try:
+                        root_state = self.root.state()
+                    except tk.TclError:
+                        root_state = "withdrawn"
+
+                    # Preserve the last known centre across the complete driver
+                    # operation. Result dialogs are created only after the UAC
+                    # process exits, when the root can still be iconic and report
+                    # an unusable position. A per-dialog cache is not sufficient.
+                    root_position_valid = (
+                        root_state not in ("iconic", "withdrawn") and
+                        rx > -10000 and ry > -10000 and rw > 1 and rh > 1
+                    )
+                    if root_position_valid:
+                        anchor["x"] = rx + rw // 2
+                        anchor["y"] = ry + rh // 2
+                        self._last_main_window_center = (anchor["x"], anchor["y"])
+                    else:
+                        cached_center = getattr(self, "_last_main_window_center", None)
+                        if cached_center:
+                            anchor["x"], anchor["y"] = cached_center
+                        else:
+                            # Last-resort recovery for a first dialog opened while
+                            # the root is already minimized: use the normal (restored)
+                            # rectangle retained by the Windows window manager.
+                            hwnd = self.get_root_hwnd()
+                            placement = WINDOWPLACEMENT()
+                            placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+                            if hwnd and ctypes.windll.user32.GetWindowPlacement(
+                                    hwnd, ctypes.byref(placement)):
+                                rect = placement.rcNormalPosition
+                                anchor["x"] = (rect.left + rect.right) // 2
+                                anchor["y"] = (rect.top + rect.bottom) // 2
+                                self._last_main_window_center = (anchor["x"], anchor["y"])
+                            else:
+                                anchor["x"] = rx + rw // 2
+                                anchor["y"] = ry + rh // 2
+                x = anchor["x"] - width // 2
+                y = anchor["y"] - height // 2
+
+                # Keep the complete dialog visible on the same virtual desktop as
+                # the main window while preserving its center whenever possible.
+                try:
+                    # Tk can report only the primary monitor as its vroot on
+                    # Windows. System metrics cover the complete multi-monitor
+                    # desktop, including monitors with negative coordinates.
+                    virtual_x = ctypes.windll.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+                    virtual_y = ctypes.windll.user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+                    virtual_w = ctypes.windll.user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+                    virtual_h = ctypes.windll.user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+                except (AttributeError, OSError):
+                    virtual_x = self.root.winfo_vrootx()
+                    virtual_y = self.root.winfo_vrooty()
+                    virtual_w = self.root.winfo_vrootwidth()
+                    virtual_h = self.root.winfo_vrootheight()
+                if virtual_w > 1 and virtual_h > 1:
+                    x = min(max(x, virtual_x), virtual_x + virtual_w - width)
+                    y = min(max(y, virtual_y), virtual_y + virtual_h - height)
+
+                window.geometry(f"{width}x{height}+{x}+{y}")
+                window.lift(self.root)
+
+                # Tk geometry coordinates can be logical pixels while Win32 window
+                # rectangles use physical pixels. On mixed-DPI desktops that sent
+                # dialogs to (0, 0). Apply the final position in one coordinate
+                # system using the actual decorated dialog size.
+                dialog_hwnd = top_level_hwnd(window)
+                dialog_rect = wintypes.RECT()
+                if (pixel_anchor["x"] is not None and dialog_hwnd and
+                        ctypes.windll.user32.GetWindowRect(
+                            dialog_hwnd, ctypes.byref(dialog_rect))):
+                    outer_w = max(1, dialog_rect.right - dialog_rect.left)
+                    outer_h = max(1, dialog_rect.bottom - dialog_rect.top)
+                    physical_x = pixel_anchor["x"] - outer_w // 2
+                    physical_y = pixel_anchor["y"] - outer_h // 2
+                    ctypes.windll.user32.SetWindowPos(
+                        dialog_hwnd, 0, physical_x, physical_y, 0, 0,
+                        0x0001 | 0x0004 | 0x0010,  # NOSIZE | NOZORDER | NOACTIVATE
+                    )
+            except (tk.TclError, RuntimeError, OSError, ValueError, ctypes.ArgumentError):
+                pass
+
+        place()
+        # The window manager may add borders or apply DPI scaling at first map.
+        # Re-center on the next idle cycle and once more after that settles.
+        try:
+            window.after_idle(place)
+            window.after(50, place)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def start_joystick_calibration_from_callback(self, virtual_controller):
         if threading.current_thread() != threading.main_thread():
@@ -2284,6 +2701,10 @@ class ControllerWindow:
 
     def refresh_esp32s3_status_async(self):
         if getattr(self, '_esp32s3_refresh_running', False) or getattr(self, 'is_quitting', False):
+            return
+        # The completed-flash dialog owns unplug detection until it and the
+        # ESP32-S3 button can be removed in one UI transaction.
+        if getattr(self, '_esp32s3_waiting_for_removal', False):
             return
         # Never probe the COM port while a firmware flash / replug is in progress —
         # doing so collides with esptool and re-occupies the port during replug.
@@ -2484,6 +2905,66 @@ class ControllerWindow:
 
         threading.Thread(target=worker, args=(attempts,), daemon=True).start()
 
+    def wait_for_esp32s3_removal_then(self, callback, should_continue=None,
+                                      consecutive_missing=0, saw_absent=False):
+        """Close the completed-flash dialog on unplug or replug initialization.
+
+        Two consecutive absent samples avoid treating a transient detection failure
+        during post-flash USB settling as a physical removal.  If the board returns
+        after an observed absence, its first detected state is the replug
+        initialization stage and closes the dialog immediately.
+        """
+        if getattr(self, "is_quitting", False):
+            return
+        if should_continue is not None and not should_continue():
+            return
+
+        def worker(previous_missing):
+            status = None
+            detection_failed = False
+            try:
+                from usb_serial_bridge import detect_bridge
+                status = detect_bridge()
+            except Exception as e:
+                detection_failed = True
+                logger.debug(f"Waiting for ESP32-S3 removal failed: {e}")
+
+            def apply_status():
+                if getattr(self, "is_quitting", False):
+                    return
+                if should_continue is not None and not should_continue():
+                    return
+                board_present = bool(status and getattr(status, "board_present", False))
+                missing = previous_missing + 1 if not board_present else 0
+                replug_initializing = bool(
+                    not detection_failed and board_present and saw_absent)
+                confirmed_removed = bool(
+                    not detection_failed and not board_present and missing >= 2)
+                if replug_initializing or confirmed_removed:
+                    self._esp32s3_waiting_for_removal = False
+                    self.esp32s3_bridge_status = status if replug_initializing else None
+                    self.esp32s3_detected = replug_initializing
+                    self._esp32s3_was_detected = replug_initializing
+                    # bridge_ready only means the firmware answered its status probe.
+                    # Runtime readiness is established later by discoverer after it
+                    # opens CDC and sends "scan on"; keep this edge unconsumed here.
+                    self._esp32s3_current_seen = False
+                    self.update_driver_buttons_visibility()
+                    callback("reinserted" if replug_initializing else "removed", status)
+                    return
+                self.root.after(
+                    500,
+                    lambda: self.wait_for_esp32s3_removal_then(
+                        callback, should_continue, missing,
+                        saw_absent or (not detection_failed and not board_present)))
+
+            try:
+                self.root.after(0, apply_status)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, args=(consecutive_missing,), daemon=True).start()
+
     def run_esp32s3_firmware_task(self, action, auto=False, status=None, on_complete=None):
         from tkinter import messagebox
         try:
@@ -2648,13 +3129,20 @@ class ControllerWindow:
             else:
                 self._esp32s3_firmware_busy = False
                 error_str = str(done["error"])
+                try:
+                    from usb_serial_bridge import flash_log, get_flash_log_path
+                    flash_log(f"flash failed: {error_str}")
+                    _log_path = get_flash_log_path()
+                except Exception:
+                    _log_path = ""
                 if "Could not put ESP32-S3" in error_str and "into flashing mode" in error_str:
                     messagebox.showerror(ESP32S3_LABEL, (
                         "Could not enter flashing mode.\n\n"
                         "To enter Boot mode manually:\n"
                         "  1. Hold the BOOT button\n"
                         "  2. Tap RESET once, then release BOOT\n"
-                        "  3. Click Repair to retry"
+                        "  3. Click Repair to retry\n\n"
+                        f"Details logged to:\n{_log_path}"
                     ))
                 else:
                     messagebox.showerror(ESP32S3_LABEL, f"ESP32-S3 N16R8 firmware operation failed:\n{done['error']}")
@@ -2719,6 +3207,7 @@ class ControllerWindow:
             ESP32S3_LABEL = "ESP32-S3 CDC"
 
         status = self.refresh_esp32s3_status()
+        dialog_state = {"status": status, "operation_started": False, "probe_running": False}
         otg_only = bool(status and getattr(status, "otg_only", False))
         # OTG in Boot mode: firmware_installed=False means ROM bootloader is running → can flash directly
         otg_boot_mode = otg_only and not bool(status and getattr(status, "firmware_installed", False))
@@ -2738,7 +3227,7 @@ class ControllerWindow:
         port_text = status.serial_port.port if status and status.serial_port else "CH343/COM not detected"
 
         dialog_w = int(480 * scaling_factor)
-        dialog_h = int(290 * scaling_factor) if otg_only else int(250 * scaling_factor)
+        dialog_h = int(290 * scaling_factor)
         dialog = tk.Toplevel(self.root)
         dialog.title(ESP32S3_LABEL)
         dialog.resizable(False, False)
@@ -2764,26 +3253,12 @@ class ControllerWindow:
         )
         info_label.pack(pady=(int(16 * scaling_factor), int(4 * scaling_factor)), padx=int(16 * scaling_factor), anchor=tk.W)
 
-        if otg_only and not otg_boot_mode:
-            # OTG with firmware running — user must manually enter Boot mode before clicking Install
-            tk.Label(
-                dialog,
-                text="OTG port detected (firmware running). Please enter Boot mode first:\n"
-                     "Hold BOOT, tap RESET once, release BOOT — then click Install.",
-                fg="#FF8800", bg="#1E1E1E",
-                font=scale_font(("Arial", 9, "bold")),
-                justify=tk.LEFT,
-                wraplength=int(440 * scaling_factor),
-            ).pack(padx=int(16 * scaling_factor), anchor=tk.W)
-        elif otg_boot_mode:
-            # OTG in ROM bootloader — ready to flash
-            tk.Label(
-                dialog,
-                text="OTG Boot mode detected — ready to install firmware.",
-                fg="#55CC55", bg="#1E1E1E",
-                font=scale_font(("Arial", 9, "bold")),
-                justify=tk.LEFT,
-            ).pack(padx=int(16 * scaling_factor), anchor=tk.W)
+        boot_status_label = tk.Label(
+            dialog, text="", fg="white", bg="#1E1E1E",
+            font=scale_font(("Arial", 9, "bold")), justify=tk.LEFT,
+            wraplength=int(440 * scaling_factor),
+        )
+        boot_status_label.pack(padx=int(16 * scaling_factor), anchor=tk.W)
 
         # Progress bar (hidden until operation starts)
         progress_var = tk.DoubleVar(value=0)
@@ -2804,19 +3279,104 @@ class ControllerWindow:
         # Phase 1: action selection buttons
         sel_frame = tk.Frame(dialog, bg="#1E1E1E")
         sel_frame.pack(pady=int(8 * scaling_factor))
+        action_buttons = {}
 
         def close_dialog():
-            dialog.grab_release()
+            self._esp32s3_waiting_for_removal = False
+            resume_callback = getattr(dialog, "_esp32s3_resume_after_close", None)
+            if resume_callback is not None:
+                dialog._esp32s3_resume_after_close = None
+                resume_callback()
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
             dialog.destroy()
 
+        def render_status(new_status):
+            dialog_state["status"] = new_status
+            current_otg = bool(new_status and getattr(new_status, "otg_only", False))
+            current_boot = current_otg and not bool(
+                new_status and getattr(new_status, "firmware_installed", False))
+            if new_status and getattr(new_status, "bridge_ready", False):
+                firmware = f"Installed ({getattr(new_status, 'firmware_version', '')})"
+            elif new_status and getattr(new_status, "firmware_current", False):
+                firmware = (
+                    f"Installed ({getattr(new_status, 'firmware_version', '')}, waiting for USB transport)")
+            elif new_status and getattr(new_status, "firmware_update_required", False):
+                current = getattr(new_status, "firmware_version", "") or "unknown"
+                expected = getattr(new_status, "expected_version", "") or "bundled"
+                firmware = f"Update required ({current} -> {expected})"
+            elif new_status and getattr(new_status, "board_present", False):
+                firmware = "Boot mode" if current_boot else "Detected, waiting for status"
+            else:
+                firmware = "Not installed"
+            port = (new_status.serial_port.port
+                    if new_status and new_status.serial_port else "CH343/COM not detected")
+            info_label.config(
+                text=f"{ESP32S3_LABEL}\nFirmware: {firmware}\nFlashing port: {port}")
+            if current_boot:
+                boot_status_label.config(
+                    text="OTG Boot mode detected — ready to install firmware.", fg="#55CC55")
+            elif current_otg:
+                boot_status_label.config(
+                    text=("OTG port detected (firmware running). Please enter Boot mode first:\n"
+                          "Hold BOOT, tap RESET once, release BOOT — then click Install."),
+                    fg="#FF8800")
+            else:
+                boot_status_label.config(text="")
+            flash_button_state = tk.NORMAL if (not current_otg or current_boot) else tk.DISABLED
+            for action in ("install", "repair"):
+                button = action_buttons.get(action)
+                if button is not None:
+                    button.config(state=flash_button_state)
+
+        def poll_boot_status():
+            if (not dialog.winfo_exists() or dialog_state["operation_started"]
+                    or dialog_state["probe_running"]):
+                return
+            dialog_state["probe_running"] = True
+
+            def worker():
+                detected_status = None
+                succeeded = False
+                try:
+                    from usb_serial_bridge import detect_bridge
+                    detected_status = detect_bridge()
+                    succeeded = True
+                except Exception as e:
+                    logger.debug(f"ESP32-S3 dialog status refresh failed: {e}")
+
+                def apply():
+                    dialog_state["probe_running"] = False
+                    if not dialog.winfo_exists() or dialog_state["operation_started"]:
+                        return
+                    if succeeded:
+                        self.esp32s3_bridge_status = detected_status
+                        self.esp32s3_detected = bool(
+                            detected_status and getattr(detected_status, "board_present", False))
+                        render_status(detected_status)
+                    dialog.after(500, poll_boot_status)
+
+                try:
+                    self.root.after(0, apply)
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+
         def choose(action):
+            current_status = dialog_state["status"]
+            current_otg = bool(current_status and getattr(current_status, "otg_only", False))
+            current_boot = current_otg and not bool(
+                current_status and getattr(current_status, "firmware_installed", False))
             if action == "delete":
                 if not messagebox.askyesno(ESP32S3_LABEL, "Erase ESP32-S3 N16R8 firmware?", parent=dialog):
                     return
 
             # OTG port with firmware running — cannot flash until Boot mode is entered.
             # Show guidance in large red text; do NOT attempt to run esptool.
-            if otg_only and not otg_boot_mode and action in ("install", "repair"):
+            if current_otg and not current_boot and action in ("install", "repair"):
                 sel_frame.pack_forget()
                 tk.Label(
                     dialog,
@@ -2843,6 +3403,7 @@ class ControllerWindow:
                 return
 
             # Transition: hide buttons, show progress
+            dialog_state["operation_started"] = True
             sel_frame.pack_forget()
             progress_bar.pack(padx=int(24 * scaling_factor), fill=tk.X)
             percent_label.pack(pady=(int(8 * scaling_factor), 0))
@@ -2867,16 +3428,19 @@ class ControllerWindow:
                 ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
                 dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-            self._run_flash_in_dialog(action, status, dialog, info_label, progress_var, percent_label, on_flash_done)
+            self._run_flash_in_dialog(
+                action, current_status, dialog, info_label, progress_var, percent_label, on_flash_done)
 
         for text, action in (("Install", "install"), ("Repair", "repair"), ("Delete", "delete")):
             frame = tk.Frame(sel_frame, bg=button_gray)
             frame.pack(side=tk.LEFT, padx=int(6 * scaling_factor))
-            tk.Button(
+            action_button = tk.Button(
                 frame, text=text, bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT,
                 font=scale_font(("Arial", 10, "bold")), width=8,
                 command=lambda a=action: choose(a),
-            ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+            )
+            action_button.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+            action_buttons[action] = action_button
 
         cancel_frame = tk.Frame(sel_frame, bg=button_gray)
         cancel_frame.pack(side=tk.LEFT, padx=int(6 * scaling_factor))
@@ -2884,6 +3448,9 @@ class ControllerWindow:
             cancel_frame, text="Cancel", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT,
             font=scale_font(("Arial", 10, "bold")), width=8, command=close_dialog,
         ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        render_status(status)
+        dialog.after(500, poll_boot_status)
 
     def _show_boot_mode_prompt(self, label="ESP32-S3 CDC"):
         dialog_w = int(480 * scaling_factor)
@@ -2999,10 +3566,24 @@ class ControllerWindow:
                 percent_label.config(text=f"{int(percent)}%")
 
         def finish():
-            def resume_discovery():
+            discovery_resumed = {"value": False}
+
+            def resume_discovery(reinserted_status=None):
+                if discovery_resumed["value"]:
+                    return
+                discovery_resumed["value"] = True
                 self._esp32s3_firmware_busy = False
                 if discoverer_was_running:
-                    self.start_discoverer_thread()
+                    startup_context = None
+                    if (reinserted_status
+                            and getattr(reinserted_status, "bridge_ready", False)
+                            and getattr(reinserted_status, "firmware_current", False)
+                            and getattr(reinserted_status, "serial_port", None)):
+                        startup_context = {
+                            "status": reinserted_status,
+                            "observed_mono": time.monotonic(),
+                        }
+                    self.start_discoverer_thread(startup_context)
 
             if done["ok"]:
                 try:
@@ -3024,17 +3605,50 @@ class ControllerWindow:
                         "Please replug the ESP32-S3 USB cable (unplug then reinsert) "
                         "to complete initialization and avoid port conflicts.",
                     )
-                    self.root.after(1500, lambda: self.wait_for_current_esp32s3_then(resume_discovery))
+                    def dialog_exists():
+                        try:
+                            return bool(dialog.winfo_exists())
+                        except Exception:
+                            return False
+
+                    def close_after_replug_event(event, detected_status):
+                        if not dialog_exists():
+                            resume_discovery(
+                                detected_status if event == "reinserted" else None)
+                            return
+                        try:
+                            dialog.grab_release()
+                        except Exception:
+                            pass
+                        dialog.destroy()
+                        resume_discovery(
+                            detected_status if event == "reinserted" else None)
+
+                    # Let the esptool hard-reset/re-enumeration settle first, then
+                    # close this completed-install dialog when the user unplugs it.
+                    self._esp32s3_waiting_for_removal = True
+                    dialog._esp32s3_resume_after_close = resume_discovery
+                    self.root.after(
+                        1500,
+                        lambda: self.wait_for_esp32s3_removal_then(
+                            close_after_replug_event, dialog_exists))
             else:
                 self._esp32s3_firmware_busy = False
                 error_str = str(done["error"])
+                try:
+                    from usb_serial_bridge import flash_log, get_flash_log_path
+                    flash_log(f"flash failed: {error_str}")
+                    _log_path = get_flash_log_path()
+                except Exception:
+                    _log_path = ""
                 if "Could not put ESP32-S3" in error_str and "into flashing mode" in error_str:
                     on_done(False, (
                         "Could not enter flashing mode.\n\n"
                         "To enter Boot mode manually:\n"
                         "  1. Hold the BOOT button\n"
                         "  2. Tap RESET once, then release BOOT\n"
-                        "  3. Click Repair to retry"
+                        "  3. Click Repair to retry\n\n"
+                        f"Details logged to:\n{_log_path}"
                     ))
                 else:
                     on_done(False, f"ESP32-S3 N16R8 firmware operation failed:\n{done['error']}")
@@ -3066,61 +3680,114 @@ class ControllerWindow:
         dialog.after(50, poll)
 
     def check_vigembus_installation(self, save=True):
-        installed = is_vigembus_installed()
-        if not installed:
+        status = get_vigembus_status()
+        if status.unknown:
+            # The query failed (e.g. pnputil without /properties); asking the user to
+            # repair a state we cannot read only nags them. The runtime bus connection
+            # is the authoritative answer, so try that before prompting for anything.
+            logger.warning("ViGEmBus status undetermined: %s", status.describe())
+            if verify_vigembus_runtime(attempts=2):
+                CONFIG.vigembus_installed = True
+                if save:
+                    CONFIG.save_config()
+                return True
+
+        if not status.installed:
             CONFIG.vigembus_installed = False
             if save:
                 CONFIG.save_config()
-            
-            import webbrowser
-            
+
+            partial = status.state == VIGEMBUS_PARTIAL
             answer = self.ask_centered_yes_no(
-                "Install ViGEmBus Driver",
-                "ViGEmBus driver is not installed on your system.\n\nDo you want to open the download page to install it?\n(https://github.com/nefarius/ViGEmBus/releases)"
+                "Repair ViGEmBus Driver" if partial else "Install ViGEmBus Driver",
+                (("ViGEmBus is partially installed and cannot start.\n\n"
+                 f"{status.describe()}\n\nDo you want to clean it up and reinstall it now?\n")
+                 if partial else
+                 ("ViGEmBus driver is not installed.\n\nDo you want to "
+                  + ("install" if utils.is_packaged() else "download and install")
+                  + " it now?\n")) +
+                "(Requires administrator privileges.)"
             )
-            
+
             if answer:
-                webbrowser.open("https://github.com/nefarius/ViGEmBus/releases")
+                if partial and not self.run_vigembus_uninstall():
+                    return False
+                installed = self.install_vigembus_driver(show_success_msg=True)
+                if installed:
+                    CONFIG.vigembus_installed = True
+                    if save:
+                        CONFIG.save_config()
+                    return True
             return False
 
-        # If installed, test if the driver is actually functioning (accessible to Python via VBus connection)
-        try:
-            from virtual_controller import get_vigem
-            test_vigem = get_vigem()
-            # Test instantiating the bus (will throw Exception if service is not started/active)
-            bus = test_vigem.win.virtual_gamepad.VBus()
-            del bus
+        if verify_vigembus_runtime():
             CONFIG.vigembus_installed = True
             if save:
                 CONFIG.save_config()
             return True
-        except Exception as e:
-            self.show_centered_message(
-                "ViGEmBus Connection Error",
-                f"ViGEmBus driver was detected in the system registry, but it failed to initialize ({e}).\n\n"
-                "Please restart your computer to apply the installation, or reinstall the driver if the issue persists."
-            )
-            CONFIG.driver_type = "WinUHid"
-            CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
+
+        self.show_centered_message(
+            "ViGEmBus Connection Error",
+            "ViGEmBus files and device are present, but the runtime bus connection failed.\n\n"
+            f"{status.describe()}\n\nUse Repair ViGEmBus Driver to cleanly reinstall it."
+        )
+        if utils.is_packaged():
+            # WinUHid is not shipped by the Store build.  Do not silently switch
+            # to a driver that the package deliberately cannot install.
             CONFIG.vigembus_installed = False
             if save:
                 CONFIG.save_config()
-            if hasattr(self, 'driver_switch'):
-                self.driver_switch.set_value("WinUHid")
             self.update_driver_button()
             return False
+        CONFIG.driver_type = "WinUHid"
+        CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
+        CONFIG.vigembus_installed = False
+        if save:
+            CONFIG.save_config()
+        if hasattr(self, 'driver_switch'):
+            self.driver_switch.set_value("WinUHid")
+        self.update_driver_button()
+        return False
 
     def check_driver_installation(self, save=True):
+        # MSIX may consume a separately installed WinUHid, but it never installs
+        # or repairs one.  Refresh the live capability silently before choosing
+        # a driver so a stale config/profile cannot re-enable unavailable paths.
+        if utils.is_packaged():
+            previous = bool(getattr(CONFIG, "driver_installed", False))
+            available = bool(refresh_packaged_winuhid_capability())
+            CONFIG.driver_installed = available
+            if save and previous != available:
+                CONFIG.save_config()
+            if not available and getattr(CONFIG, "driver_type", "WinUHid") == "WinUHid":
+                CONFIG.driver_type = "ViGEmBus"
+                CONFIG.simulation_mode = getattr(CONFIG, "vigembus_sim_mode", "Xbox360")
+                if save:
+                    CONFIG.save_config()
         # If driver type is USBIP, check USBIP driver instead
         if getattr(CONFIG, "driver_type", "") == "USBIP":
-            usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-            if not os.path.exists(usbip_exe):
+            usbip_status = get_usbip_status()
+            if usbip_status.unknown:
+                # Undetermined is not "missing": fall back to the executable the
+                # rest of the app invokes rather than nagging on every launch.
+                logger.warning("USBIP status undetermined: %s", usbip_status.describe())
+            usbip_ready = usbip_status.installed or (
+                usbip_status.unknown
+                and os.path.exists("C:\\Program Files\\USBip\\usbip.exe"))
+            if not usbip_ready:
+                partial = usbip_status.state == USBIP_PARTIAL
                 answer = self.ask_centered_yes_no(
-                    "Install USBIP Driver",
-                    "Switch emulation is selected, but the USBIP driver is not installed.\n\n"
-                    "Do you want to install it now?\n(Requires administrator privileges and will temporarily reset USB connections.)"
+                    "Repair USBIP Driver" if partial else "Install USBIP Driver",
+                    (("USBIP is partially installed and cannot be used reliably.\n\n"
+                      f"{usbip_status.describe()}\n\nDo you want to clean it up and reinstall it now?\n")
+                     if partial else
+                     "Switch emulation is selected, but the USBIP driver is not installed.\n\n"
+                     "Do you want to install it now?\n") +
+                    "(Requires administrator privileges and will temporarily reset USB connections.)"
                 )
                 if answer:
+                    if partial and not self.run_usbip_uninstall():
+                        return
                     self.run_usbip_install(show_success_msg=False)
             return
 
@@ -3130,7 +3797,18 @@ class ControllerWindow:
             return
 
         # 憒?yaml鋆⊥?撌脣?鋆?蝝????app???炎?交?行?摰?嚗璇辣??app
-        if is_driver_installed():
+        winuhid_status = get_winuhid_status()
+        if winuhid_status.unknown:
+            # Undetermined is not broken: fall back to the runtime smoke test rather
+            # than prompting for a repair that this machine's pnputil cannot perform.
+            logger.warning("WinUHid status undetermined: %s", winuhid_status.describe())
+            if verify_winuhid_runtime(attempts=2):
+                CONFIG.driver_installed = True
+                if save:
+                    CONFIG.save_config()
+                return
+
+        if winuhid_status.installed:
             # 憒?瑼Ｘ蝯??臬歇摰?嚗???yaml鋆?
             CONFIG.driver_installed = True
             if save:
@@ -3143,19 +3821,338 @@ class ControllerWindow:
                 CONFIG.save_config()
             self.update_driver_button()
             
+        partial = winuhid_status.state == WINUHID_PARTIAL
+        if partial:
+            prompt = (
+                "WinUHid is only partially installed and cannot be used reliably.\n\n"
+                f"{winuhid_status.describe()}\n\n"
+                "Do you want to clean up and reinstall it now?\n(Requires administrator privileges.)"
+            )
+        else:
+            prompt = "WinUHid driver is not installed.\n\nDo you want to install it now?\n(Requires administrator privileges.)"
         answer = self.ask_centered_yes_no(
-            "Install Virtual Controller Driver",
-            "WinUHid driver is not installed on your system.\n\nDo you want to install it now?\n(Requires administrator privileges.)"
-        )
+            "Repair WinUHid Driver" if partial else "Install WinUHid Driver", prompt)
         
         if answer:
+            if winuhid_status.state == WINUHID_PARTIAL and not self.run_driver_uninstall():
+                return
             self.run_driver_install(show_success_msg=False)
 
+    def _launch_elevated(self, lp_file, lp_params, progress_win=None, lp_dir=None, hide=True):
+        """Launch a process elevated (UAC runas), bringing the consent prompt to the
+        foreground and hiding the child window. Used for every driver install/uninstall
+        so the PowerShell console never pops up (progress is shown in the app's own
+        dialog) and the UAC prompt doesn't just flash in the taskbar.
+        Returns hProcess (int) or None if the launch failed / UAC was declined.
+        """
+        info = SHELLEXECUTEINFOW()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = SEE_MASK_NOCLOSEPROCESS
+        info.hwnd = self.get_root_hwnd()
+        info.lpVerb = "runas"
+        info.lpFile = lp_file
+        info.lpParameters = lp_params
+        info.lpDirectory = lp_dir
+        info.nShow = 0 if hide else 1  # SW_HIDE vs SW_SHOWNORMAL
+        # Grant foreground rights + drop any modal grab so the UAC consent prompt comes
+        # to the front instead of only flashing in the taskbar.
+        try:
+            if progress_win is not None:
+                progress_win.grab_release()
+            self.root.focus_force()
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+        except Exception:
+            pass
+        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+            return None
+        return info.hProcess
+
+    @staticmethod
+    def _ps_hidden_args(script_path):
+        """PowerShell args that run a script with no visible console window."""
+        return f'-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{script_path}"'
+
+    @staticmethod
+    def _read_winuhid_uninstall_log():
+        log_path = os.path.join(os.environ.get("TEMP", ""), "Switch2Connect_WinUHid_uninstall.log")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+                content = stream.read().strip()
+            lines = content.splitlines()
+            keywords = ("error", "failed", "incomplete", "does not exist", "fallback")
+            important = [line for line in lines if any(word in line.lower() for word in keywords)]
+            summary = important[-12:] if important else lines[-12:]
+            return "\n".join(summary)[-1400:]
+        except Exception:
+            return "Uninstaller log was not available."
+
+    @staticmethod
+    def _read_vigembus_uninstall_log():
+        log_path = os.path.join(os.environ.get("TEMP", ""), "Switch2Connect_ViGEmBus_uninstall.log")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+                lines = stream.read().strip().splitlines()
+            keywords = ("error", "failed", "incomplete", "does not exist")
+            important = [line for line in lines if any(word in line.lower() for word in keywords)]
+            return "\n".join((important or lines)[-12:])[-1400:]
+        except Exception:
+            return "Uninstaller log was not available."
+
+    def install_vigembus_driver(self, show_success_msg=True):
+        """Install ViGEmBus. The packaged build installs from the bundled vgamepad
+        ViGEmBus MSI (no download); the standalone .exe build downloads the official
+        installer (unchanged). Returns True once ViGEmBus is verified working."""
+        if utils.is_packaged():
+            return self.run_vigembus_install(show_success_msg=show_success_msg)
+        return self.download_and_install_driver("ViGEmBus", verify_vigembus_ready, show_success_msg)
+
+    def run_vigembus_install(self, show_success_msg=True):
+        """Install ViGEmBus from the ViGEmBus MSI bundled inside the package (vgamepad),
+        elevated and silent — no network access. Used by the MSIX/packaged build."""
+        import os, glob
+        # Locate the bundled ViGEmBusSetup MSI (vgamepad ships it under win/vigem/install).
+        roots = []
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            roots.append(base)
+        roots.append(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import vgamepad
+            roots.append(os.path.dirname(os.path.abspath(vgamepad.__file__)))
+        except Exception:
+            pass
+        msi = None
+        for root in roots:
+            hits = glob.glob(os.path.join(root, "vgamepad", "win", "vigem", "install", "x64", "ViGEmBusSetup_x64.msi"))
+            hits += glob.glob(os.path.join(root, "**", "ViGEmBusSetup_x64.msi"), recursive=True)
+            if hits:
+                msi = hits[0]
+                break
+        if not msi or not os.path.exists(msi):
+            self.show_centered_message("Error", "Could not find the bundled ViGEmBus installer. Please verify the application files.")
+            return False
+
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("Install ViGEmBus Driver")
+        progress_win.resizable(False, False)
+        progress_win.config(bg="#1E1E1E")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        self.center_window_on_root(progress_win, int(450 * scaling_factor), int(130 * scaling_factor))
+        tk.Label(progress_win, text="Installing ViGEmBus driver...\nPlease authorize the UAC prompt if asked.",
+                 fg="white", bg="#1E1E1E", font=scale_font(("Arial", 11, "bold"))).pack(pady=int(40 * scaling_factor))
+
+        hProcess = self._launch_elevated("msiexec.exe", f'/i "{msi}" /qn /norestart', progress_win=progress_win)
+        if not hProcess:
+            progress_win.grab_release()
+            progress_win.destroy()
+            self.show_centered_message("Error", "ViGEmBus install was cancelled or failed to start (UAC prompt declined).")
+            return False
+
+        def check_process():
+            if hProcess and ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0) == WAIT_TIMEOUT:
+                progress_win.after(200, check_process)
+                return
+            if hProcess:
+                ctypes.windll.kernel32.CloseHandle(hProcess)
+            progress_win.grab_release()
+            progress_win.destroy()
+        progress_win.after(200, check_process)
+        self.root.wait_window(progress_win)
+
+        invalidate_driver_status_cache("vigembus")
+        ok = verify_vigembus_ready()
+        if ok:
+            if show_success_msg:
+                self.show_centered_message("Success", "ViGEmBus driver installed successfully.")
+        else:
+            self.show_centered_message(
+                "Error",
+                "ViGEmBus installation was not completed. A system restart may be required; please try again if the issue persists.")
+        return ok
+
+    def download_and_install_driver(self, driver_key, verify_fn, show_success_msg=True):
+        """Download a driver installer and run it silently with UAC elevation.
+
+        Standalone .exe build only: used for the ViGEmBus one-click install (the
+        packaged build installs ViGEmBus from the bundled MSI instead, and all other
+        drivers are installed from bundled files in both builds).
+        Returns True if verify_fn() reports the driver installed afterwards.
+        """
+        return self._download_and_run_driver_action(driver_key, verify_fn, "install", show_success_msg)
+
+    def _download_and_run_driver_action(self, driver_key, verify_fn, action, show_success_msg=True):
+        """Download ViGEmBus's installer and run it silently with UAC elevation, with a
+        progress dialog. Standalone .exe build only (the packaged build never downloads).
+        verify_fn() returns True once ViGEmBus is installed."""
+        from driver_install_helper import DRIVER_SPECS, make_download_dir, download_spec_files
+
+        spec = DRIVER_SPECS.get(driver_key)
+        if spec is None:
+            self.show_centered_message("Error", f"Unknown driver: {driver_key}")
+            return False
+
+        # Present-tense / past-tense words for dialog and result messages.
+        gerund = "Installing" if action == "install" else "Uninstalling"
+        past = "installed" if action == "install" else "uninstalled"
+        title_verb = "Install" if action == "install" else "Uninstall"
+        dl_key = driver_key if action == "install" else f"{driver_key}_uninstall"
+
+        # Tracks whether the elevated installer/uninstaller actually started (vs a
+        # download failure or a declined UAC prompt). Callers can read it afterwards.
+        self._last_driver_action_launched = True
+
+        # Stop discoverer and release virtual controller handles first.
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title(f"{title_verb} {spec.display_name} Driver")
+        progress_w = int(460 * scaling_factor)
+        progress_h = int(140 * scaling_factor)
+        progress_win.resizable(False, False)
+        progress_win.config(bg="#1E1E1E")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        self.center_window_on_root(progress_win, progress_w, progress_h)
+
+        label = tk.Label(
+            progress_win,
+            text=f"Downloading {spec.display_name} driver...",
+            fg="white", bg="#1E1E1E",
+            font=scale_font(("Arial", 11, "bold")),
+            justify="center"
+        )
+        label.pack(pady=int(45 * scaling_factor))
+
+        state = {"result": None, "installer_path": None, "error": None, "exit_code": None}
+
+        def set_label(text):
+            try:
+                label.config(text=text)
+            except Exception:
+                pass
+
+        def progress_cb(filename, downloaded, total):
+            if total and total > 0:
+                pct = int(downloaded * 100 / total)
+                self.root.after(0, set_label, f"Downloading {spec.display_name} driver... {pct}%")
+            else:
+                mb = downloaded / (1024 * 1024)
+                self.root.after(0, set_label, f"Downloading {spec.display_name} driver... {mb:.1f} MB")
+
+        def do_download():
+            try:
+                dest_dir = make_download_dir(dl_key)
+                installer = download_spec_files(spec, dest_dir, progress_cb)
+                state["installer_path"] = installer
+            except Exception as e:
+                state["error"] = str(e)
+            self.root.after(0, after_download)
+
+        def after_download():
+            if state["error"]:
+                self._last_driver_action_launched = False
+                progress_win.grab_release()
+                progress_win.destroy()
+                self.show_centered_message(
+                    "Download Error",
+                    f"Failed to download the {spec.display_name} {action} script:\n{state['error']}\n\n"
+                    "Please check your internet connection and try again."
+                )
+                if discoverer_was_running:
+                    self.start_discoverer_thread()
+                return
+            set_label(f"{gerund} {spec.display_name} driver...\nPlease authorize the UAC prompt if asked.")
+            self.root.after(50, launch_installer)
+
+        def launch_installer():
+            kind = spec.run[0]
+            installer_path = state["installer_path"]
+            if kind == "exe":
+                lp_file = installer_path
+                lp_params = spec.run[2]
+            else:  # ps1
+                lp_file = "powershell.exe"
+                lp_params = self._ps_hidden_args(installer_path)
+
+            hProcess = self._launch_elevated(
+                lp_file, lp_params, progress_win=progress_win,
+                lp_dir=os.path.dirname(installer_path))
+            if not hProcess:
+                self._last_driver_action_launched = False
+                progress_win.grab_release()
+                progress_win.destroy()
+                self.show_centered_message(
+                    "Error",
+                    f"{spec.display_name} {action} was cancelled or failed to start (UAC prompt declined)."
+                )
+                if discoverer_was_running:
+                    self.start_discoverer_thread()
+                return
+
+            def check_process():
+                if hProcess:
+                    res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+                    if res == WAIT_TIMEOUT:
+                        progress_win.after(200, check_process)
+                        return
+                    exit_code = wintypes.DWORD()
+                    ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                    state["exit_code"] = exit_code.value
+                    ctypes.windll.kernel32.CloseHandle(hProcess)
+                progress_win.grab_release()
+                progress_win.destroy()
+
+            progress_win.after(200, check_process)
+
+        threading.Thread(target=do_download, daemon=True).start()
+        self.root.wait_window(progress_win)
+
+        action_ok = False
+        try:
+            action_ok = state["exit_code"] == 0 and bool(verify_fn())
+        except Exception as e:
+            logger.error(f"Driver verification failed for {driver_key} ({action}): {e}")
+
+        if action_ok:
+            if show_success_msg:
+                self.show_centered_message("Success", f"{spec.display_name} driver {past} successfully.")
+        elif state["error"] is None:
+            detail = ""
+            if driver_key == "WinUHid" and action == "uninstall":
+                detail = "\n\n" + self._read_winuhid_uninstall_log()
+            elif driver_key == "ViGEmBus" and action == "uninstall":
+                detail = "\n\n" + self._read_vigembus_uninstall_log()
+            self.show_centered_message(
+                "Error",
+                f"{spec.display_name} {action} was not completed or failed "
+                f"(exit code: {state['exit_code']}).\n"
+                "A system restart may be required. Please try again if the issue persists."
+                f"{detail}"
+            )
+
+        if discoverer_was_running:
+            self.start_discoverer_thread()
+        return action_ok
+
     def run_driver_install(self, show_success_msg=True):
+        if utils.is_packaged():
+            self.show_centered_message(
+                "Unavailable",
+                "WinUHid Driver Mode is not available in the Microsoft Store version."
+            )
+            return False
+        # Drivers are bundled in the package (both builds); install from the local
+        # files below — never downloaded (Store policy 10.2.10.1 / 10.1.5).
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before installation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
@@ -3188,18 +4185,8 @@ class ControllerWindow:
                 label.pack(pady=int(40 * scaling_factor))
                 
                 # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = "powershell.exe"
-                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{install_ps1}"'
-                info.lpDirectory = None
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(install_ps1), progress_win=progress_win)
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3208,7 +4195,6 @@ class ControllerWindow:
                         self.start_discoverer_thread()
                     return
 
-                hProcess = info.hProcess
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3232,7 +4218,13 @@ class ControllerWindow:
                 
                 logger.info(f"Driver installer process exited with code: {proc_exit_code[0]}")
                 
-                driver_installed_ok = is_driver_installed()
+                invalidate_driver_status_cache("winuhid")
+                driver_status = get_winuhid_status()
+                # When the layers cannot be read, the runtime smoke test is the verdict;
+                # otherwise a Win10 install that actually succeeded reports as failed.
+                runtime_ok = ((driver_status.installed or driver_status.unknown)
+                              and verify_winuhid_runtime())
+                driver_installed_ok = proc_exit_code[0] == 0 and runtime_ok
                 if driver_installed_ok:
                     CONFIG.driver_installed = True
                     CONFIG.save_config()
@@ -3241,7 +4233,9 @@ class ControllerWindow:
                 else:
                     self.show_centered_message(
                         "Error",
-                        "Driver installation was not completed or failed.\nSome emulator functions may not work."
+                        "Driver installation was not completed or failed.\n\n"
+                        f"Exit code: {proc_exit_code[0]}\nRuntime smoke test: {runtime_ok}\n"
+                        f"{driver_status.describe()}"
                     )
                 self.update_driver_button()
             except Exception as e:
@@ -3251,18 +4245,22 @@ class ControllerWindow:
 
         if discoverer_was_running:
             self.start_discoverer_thread()
+        return bool(locals().get('driver_installed_ok', False))
 
     def run_driver_uninstall(self):
+        # MSIX may remove an externally installed WinUHid, but it must never
+        # install or repair one.  The uninstall script is bundled locally so
+        # this path does not download or acquire software at runtime.
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before uninstallation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
             discoverer_was_running = True
             self.stop_discoverer_thread()
-            
+
         # Run emergency cleanup to close all virtual controller handles immediately
         from discoverer import emergency_cleanup
         emergency_cleanup()
@@ -3289,18 +4287,8 @@ class ControllerWindow:
                 label.pack(pady=int(40 * scaling_factor))
                 
                 # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = "powershell.exe"
-                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"'
-                info.lpDirectory = None
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(uninstall_ps1), progress_win=progress_win)
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3309,7 +4297,6 @@ class ControllerWindow:
                         self.start_discoverer_thread()
                     return
 
-                hProcess = info.hProcess
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3334,15 +4321,29 @@ class ControllerWindow:
                 logger.info(f"Driver uninstaller process exited with code: {proc_exit_code[0]}")
                 
                 # Now that progress_win is destroyed, check if it was removed
-                driver_removed_ok = not is_driver_installed()
+                invalidate_driver_status_cache("winuhid")
+                driver_status = get_winuhid_status()
+                driver_removed_ok = proc_exit_code[0] == 0 and removal_verified(
+                    driver_status, verify_winuhid_runtime)
                 if driver_removed_ok:
                     CONFIG.driver_installed = False
                     CONFIG.save_config()
+                    if utils.is_packaged():
+                        refresh_packaged_winuhid_capability()
+                        # A removed active WinUHid cannot keep virtual devices
+                        # alive.  Move the current profile back to ViGEmBus;
+                        # the normal driver-change path performs its readiness
+                        # check and recreates the virtual controller safely.
+                        if getattr(CONFIG, "driver_type", "") == "WinUHid":
+                            self.update_driver_type_setting("ViGEmBus")
                     self.show_centered_message("Success", "WinUHid driver uninstalled successfully.")
                 else:
+                    uninstall_log = self._read_winuhid_uninstall_log()
                     self.show_centered_message(
                         "Error",
-                        "Driver uninstallation failed or was cancelled."
+                        "Driver uninstallation failed or left WinUHid components behind.\n\n"
+                        f"Exit code: {proc_exit_code[0]}\n{driver_status.describe()}"
+                        f"\n\nUninstaller details:\n{uninstall_log}"
                     )
                 self.update_driver_button()
             except Exception as e:
@@ -3352,6 +4353,7 @@ class ControllerWindow:
 
         if discoverer_was_running:
             self.start_discoverer_thread()
+        return bool(locals().get('driver_removed_ok', False))
 
     def stop_discoverer_thread(self):
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
@@ -3360,24 +4362,25 @@ class ControllerWindow:
             self.discoverer_thread.join(timeout=5.0)
             self.discoverer_thread = None
 
-    def start_discoverer_thread(self):
+    def start_discoverer_thread(self, startup_bridge_context=None):
         self.stop_discoverer_thread()
         self.quit_event.clear()
         
         def run():
             _set_current_thread_priority(1)
             from discoverer import start_discoverer
-            start_discoverer(self.discoverer_callback, self.quit_event)
+            start_discoverer(self.discoverer_callback, self.quit_event, startup_bridge_context)
             
         logger.info("Starting discoverer thread...")
         self.discoverer_thread = threading.Thread(target=run, daemon=True)
         self.discoverer_thread.start()
 
     def run_vigembus_uninstall(self):
+        # Uninstall from the bundled script (both builds); nothing downloaded.
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before uninstallation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
@@ -3410,18 +4413,8 @@ class ControllerWindow:
                 label.pack(pady=int(40 * scaling_factor))
                 
                 # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = "powershell.exe"
-                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"'
-                info.lpDirectory = None
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(uninstall_ps1), progress_win=progress_win)
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3430,7 +4423,6 @@ class ControllerWindow:
                         self.start_discoverer_thread()
                     return
 
-                hProcess = info.hProcess
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3454,7 +4446,10 @@ class ControllerWindow:
                 
                 logger.info(f"ViGEmBus uninstaller process exited with code: {proc_exit_code[0]}")
                 
-                driver_removed_ok = (proc_exit_code[0] == 0)
+                invalidate_driver_status_cache("vigembus")
+                status = get_vigembus_status()
+                driver_removed_ok = proc_exit_code[0] == 0 and removal_verified(
+                    status, verify_vigembus_runtime)
                 if driver_removed_ok:
                     CONFIG.vigembus_installed = False
                     CONFIG.save_config()
@@ -3462,7 +4457,9 @@ class ControllerWindow:
                 else:
                     self.show_centered_message(
                         "Error",
-                        "ViGEmBus uninstallation failed or was cancelled."
+                        "ViGEmBus uninstallation failed or left components behind.\n\n"
+                        f"Exit code: {proc_exit_code[0]}\n{status.describe()}\n\n"
+                        f"Uninstaller details:\n{self._read_vigembus_uninstall_log()}"
                     )
                 self.update_driver_button()
             except Exception as e:
@@ -3472,22 +4469,53 @@ class ControllerWindow:
 
         if discoverer_was_running:
             self.start_discoverer_thread()
+        return bool(locals().get('driver_removed_ok', False))
 
     def on_driver_btn_clicked(self):
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         if driver_type == "ViGEmBus":
-            if getattr(CONFIG, 'vigembus_installed', False):
+            vigem_status = get_vigembus_status()
+            if vigem_status.state == VIGEMBUS_HEALTHY:
                 if self.ask_centered_yes_no("Uninstall Driver", "Are you sure you want to uninstall the ViGEmBus driver?\n(Requires administrator privileges.)"):
                     self.run_vigembus_uninstall()
+            elif vigem_status.state == VIGEMBUS_PARTIAL:
+                if self.ask_centered_yes_no(
+                    "Repair Driver",
+                    "ViGEmBus is partially installed. Clean up all broken nodes and reinstall it?\n\n"
+                    f"{vigem_status.describe()}\n\n(Requires administrator privileges.)"
+                ):
+                    if self.run_vigembus_uninstall():
+                        installed = self.install_vigembus_driver(show_success_msg=True)
+                        if installed:
+                            CONFIG.vigembus_installed = True
+                            CONFIG.save_config()
+                        self.update_driver_button()
             else:
-                import webbrowser
-                webbrowser.open("https://github.com/nefarius/ViGEmBus/releases")
+                installed = self.install_vigembus_driver(show_success_msg=True)
+                if installed:
+                    CONFIG.vigembus_installed = True
+                    CONFIG.save_config()
+                self.update_driver_button()
         else:
-            if getattr(CONFIG, 'driver_installed', False):
+            winuhid_status = get_winuhid_status()
+            if winuhid_status.state == WINUHID_HEALTHY:
                 if self.ask_centered_yes_no("Uninstall Driver", "Are you sure you want to uninstall the WinUHid driver?\n(Requires administrator privileges.)"):
                     self.run_driver_uninstall()
+            elif winuhid_status.state == WINUHID_PARTIAL:
+                if self.ask_centered_yes_no(
+                    "Repair Driver",
+                    "WinUHid is partially installed. Clean up the broken installation and reinstall it?\n\n"
+                    f"{winuhid_status.describe()}\n\n(Requires administrator privileges.)"
+                ):
+                    if self.run_driver_uninstall():
+                        self.run_driver_install()
             else:
                 self.run_driver_install()
+
+    def wired_controller_label(self, sentence=False):
+        """UI name for the wired pad(s) currently connected."""
+        return wired_controller_label(
+            getattr(self, "wired_controller_pids", ()) or (), sentence=sentence)
 
     def update_driver_buttons_visibility(self):
         if not hasattr(self, 'top_btn_frame'):
@@ -3506,11 +4534,15 @@ class ControllerWindow:
         
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         
-        # Pack the active driver button
+        # Pack the active driver button.  MSIX exposes WinUHid's uninstall
+        # operation only when a healthy external copy is present; installation
+        # remains an external Manager responsibility.
         if driver_type == "USBIP":
             if hasattr(self, 'usbip_frame'):
                 self.usbip_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
-        else:
+        elif not (utils.is_packaged()
+                  and driver_type == "WinUHid"
+                  and not packaged_winuhid_available()):
             if hasattr(self, 'driver_frame'):
                 self.driver_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
@@ -3536,6 +4568,9 @@ class ControllerWindow:
             self.esp32s3_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
         if hasattr(self, 'wired_pro_settings_frame'):
+            # Name the button after whatever is actually plugged in.
+            if hasattr(self, 'wired_pro_settings_btn'):
+                self.wired_pro_settings_btn.config(text=self.wired_controller_label())
             self.wired_pro_settings_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
         # Pack the rest of the buttons
@@ -3544,6 +4579,573 @@ class ControllerWindow:
         if hasattr(self, 'hide_frame'): self.hide_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
         self.update_header_status()
+
+    def _kofi_anchor(self):
+        """Return (center_x, bottom_y) in screen pixels just below the Ko-fi button."""
+        self.root.update_idletasks()
+        button = getattr(self, "kofi_button", None)
+        if button is not None and button.winfo_exists():
+            return (
+                button.winfo_rootx() + button.winfo_width() // 2,
+                button.winfo_rooty() + button.winfo_height(),
+            )
+        return (
+            self.root.winfo_rootx() + self.root.winfo_width() // 2,
+            self.root.winfo_rooty(),
+        )
+
+    def _open_kofi_window(self):
+        """Toggle the Ko-fi donation popup.
+
+        The widget runs in a separate pywebview process (mirrors the DualSense
+        server child) so pywebview owns its own main thread/event loop and does
+        not collide with the Tkinter main loop. The process is kept alive across
+        opens: dismissing only *hides* the window so the Ko-fi page never
+        reloads. Clicking the button toggles show/hide; clicking elsewhere in the
+        app hides it. Falls back to the system browser if the child cannot be
+        launched, so the donation link never breaks.
+        """
+        process = getattr(self, "_kofi_process", None)
+        if process is not None and process.poll() is None:
+            # The button toggles: hide when shown, show when hidden. (Clicks that
+            # land on the button are excluded from the outside-click dismissal by
+            # _click_on_kofi_button, so this handler alone drives the toggle.)
+            if getattr(self, "_kofi_visible", False):
+                self._hide_kofi_window()
+            else:
+                self._show_kofi_window()
+            return
+        self._spawn_kofi_window()
+
+    def _begin_kofi_placeholder_handoff(self):
+        """Show the stand-in now and hand over once the child window arrives.
+
+        Skipped when the child's window already exists on screen, where showing a
+        placeholder would only add a flash before an already-instant open.
+        """
+        if getattr(self, "_kofi_window_ready", False):
+            return
+        self._show_kofi_placeholder()
+        self._cancel_kofi_ready_poll()
+        self._poll_kofi_window_ready()
+
+    def _kofi_root_dpi_ratio(self):
+        """Windows' own DPI scale for the monitor the main window is on."""
+        try:
+            get_dpi = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
+            root_hwnd = self.get_root_hwnd()
+            if get_dpi is not None and root_hwnd:
+                dpi = int(get_dpi(int(root_hwnd)))
+                if dpi > 0:
+                    return dpi / 96.0
+        except Exception:
+            pass
+        return 1.0
+
+    # Never shrink the popup past this, even on a very short work area; below it
+    # the Ko-fi form stops being usable and a scrollbar is the better trade.
+    _KOFI_MIN_SCALE = 0.55
+
+    def _kofi_scale(self, anchor_bottom_y=None):
+        """Scale for the popup, on the app's own scaling rule rather than raw DPI.
+
+        The rest of the UI is sized by `scaling_factor`, which is deliberately
+        DPI-independent and already tracks the usable work area. Sizing the popup
+        by the raw DPI ratio instead made it disagree with the app on every
+        display whose scale did not happen to match, and at the current design
+        height it ran off the bottom of a 1080p screen entirely.
+
+        The result is additionally clamped so the panel always fits between the
+        button and the bottom of the work area - that is what keeps the whole
+        Ko-fi page reachable on short screens.
+        """
+        from kofi_webview import _VIEW_WIDTH, _VIEW_HEIGHT
+
+        scale = float(scaling_factor) if scaling_factor else 1.0
+        if anchor_bottom_y is None:
+            anchor_bottom_y = self._kofi_anchor()[1]
+        try:
+            work_area = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(work_area), 0):
+                available_height = work_area.bottom - int(anchor_bottom_y)
+                available_width = work_area.right - work_area.left
+                if available_height > 0:
+                    scale = min(scale, available_height / float(_VIEW_HEIGHT))
+                if available_width > 0:
+                    scale = min(scale, available_width / float(_VIEW_WIDTH))
+        except Exception:
+            pass
+        return max(self._KOFI_MIN_SCALE, scale)
+
+    def _kofi_popup_geometry(self):
+        """(width, height, left, top) the Ko-fi popup will occupy, in screen pixels.
+
+        Must match _position_native_window in kofi_webview.py exactly, or the
+        hand-off from this placeholder to the real window is visible as a jump.
+        Tk's own screen coordinates are physical pixels here (verified against
+        GetWindowRect), which is the same space the child positions itself in.
+        """
+        from kofi_webview import _VIEW_WIDTH, _VIEW_HEIGHT
+
+        anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+        # While a child is running it keeps the scale it was launched with, so
+        # the expected geometry has to use that too. Recomputing it here would
+        # disagree the moment the main window is dragged, and the hand-off waits
+        # on the two agreeing exactly.
+        scale = getattr(self, "_kofi_active_scale", None)
+        if not scale:
+            scale = self._kofi_scale(anchor_bottom_y)
+        width = int(round(_VIEW_WIDTH * scale))
+        height = int(round(_VIEW_HEIGHT * scale))
+        # Same rounding as the child: `- width // 2` would drift by a pixel.
+        left = int(round(anchor_center_x - width / 2.0))
+        return width, height, left, int(anchor_bottom_y)
+
+    def _show_kofi_placeholder(self):
+        """Put a stand-in window under the button immediately.
+
+        Starting the child costs about a second (process start-up plus WebView2
+        initialisation), which is long enough for the button to feel broken. This
+        Tk window takes single-digit milliseconds and looks identical to the
+        loading state the child shows, so the click always produces a window at
+        once and the real one takes over silently.
+        """
+        from kofi_webview import _PAGE_BG
+
+        width, height, left, top = self._kofi_popup_geometry()
+        placeholder = getattr(self, "_kofi_placeholder", None)
+        try:
+            if placeholder is None or not placeholder.winfo_exists():
+                placeholder = tk.Toplevel(self.root)
+                # Borderless and out of the taskbar, matching the child's
+                # tool-window style; overrideredirect also keeps focus put.
+                placeholder.overrideredirect(True)
+                placeholder.configure(bg=_PAGE_BG)
+                placeholder.transient(self.root)
+                tk.Label(
+                    placeholder,
+                    text="Loading Ko-fi…",
+                    bg=_PAGE_BG,
+                    fg="#8a8a8a",
+                    font=scale_font(("Segoe UI", 11)),
+                ).place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+                # Clicking the placeholder must not dismiss it, the same way
+                # clicking the real popup does not.
+                placeholder.bind("<ButtonPress>", lambda _e: "break")
+                self._kofi_placeholder = placeholder
+                self._own_placeholder_to_main_window(
+                    placeholder, self.get_root_hwnd())
+                self._round_placeholder_corners(placeholder)
+            placeholder.geometry(f"{width}x{height}+{left}+{top}")
+            placeholder.deiconify()
+            placeholder.lift()
+            placeholder.update_idletasks()
+        except Exception as e:
+            logger.debug(f"Failed to show Ko-fi placeholder: {e}")
+
+    @staticmethod
+    def _own_placeholder_to_main_window(placeholder, owner_hwnd):
+        """Make the stand-in an owned window of the main GUI window.
+
+        Tk's transient() does not establish a Win32 owner for an overrideredirect
+        window, so the main window would sit in front of it - and clicking the
+        Ko-fi button is itself what activates and raises the main window, so the
+        stand-in was being covered the instant it appeared. Windows always keeps
+        an owned window above its owner, which is the same mechanism the real
+        popup already uses (see _set_owner in kofi_webview.py).
+        """
+        if not owner_hwnd or sys.platform != "win32":
+            return
+        try:
+            # wm_frame() is the top-level handle and is only valid once realized;
+            # winfo_id() would give the inner Tk window instead.
+            placeholder.update_idletasks()
+            hwnd = int(placeholder.wm_frame(), 16)
+            user32 = ctypes.windll.user32
+            GWLP_HWNDPARENT = -8
+            set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+            set_long(wintypes.HWND(hwnd), GWLP_HWNDPARENT,
+                     wintypes.HWND(int(owner_hwnd)))
+        except Exception as e:
+            # Falling back to the previous behaviour is survivable: the popup
+            # still opens, it just may be covered by the main window.
+            logger.debug(f"Could not own the Ko-fi placeholder to the main window: {e}")
+
+    @staticmethod
+    def _round_placeholder_corners(placeholder):
+        """Round the stand-in's corners to match the real popup.
+
+        Windows 11 rounds ordinary top-level windows itself, which is why the
+        Ko-fi window has rounded corners, but an overrideredirect window has no
+        frame for it to round - so the stand-in came out square and the hand-off
+        changed shape. Asking DWM for rounded corners explicitly fixes that.
+        On Windows 10 the attribute does not exist and the call simply fails,
+        which is correct: nothing is rounded there, including the real popup.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            placeholder.update_idletasks()
+            hwnd = int(placeholder.wm_frame(), 16)
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWCP_ROUND = 2
+            preference = ctypes.c_int(DWMWCP_ROUND)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd), DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(preference), ctypes.sizeof(preference))
+        except Exception as e:
+            logger.debug(f"Could not round the Ko-fi placeholder corners: {e}")
+
+    def _hide_kofi_placeholder(self):
+        """Remove the stand-in, either on hand-off or when the popup is dismissed."""
+        self._cancel_kofi_ready_poll()
+        placeholder = getattr(self, "_kofi_placeholder", None)
+        self._kofi_placeholder = None
+        if placeholder is None:
+            return
+        try:
+            placeholder.destroy()
+        except Exception:
+            pass
+
+    def _reposition_kofi_placeholder(self):
+        placeholder = getattr(self, "_kofi_placeholder", None)
+        if placeholder is None:
+            return
+        try:
+            if not placeholder.winfo_exists():
+                self._kofi_placeholder = None
+                return
+            width, height, left, top = self._kofi_popup_geometry()
+            placeholder.geometry(f"{width}x{height}+{left}+{top}")
+        except Exception:
+            pass
+
+    # The child's window may be a couple of pixels off if Windows clamps it.
+    _KOFI_MATCH_TOLERANCE = 2
+
+    def _kofi_child_window_in_place(self):
+        """True once the child's real window sits exactly where we expect it.
+
+        Matching the expected rectangle rather than just "visible somewhere" is
+        deliberate. The child process owns several top-level windows (WebView2
+        helpers), and pywebview's own window is briefly visible at its default
+        position - on a secondary monitor, at that monitor's scale - before it is
+        moved under the button. Handing over to that would flash a misplaced
+        window, so the geometry has to agree before the placeholder goes away.
+        """
+        process = getattr(self, "_kofi_process", None)
+        if process is None or process.poll() is not None:
+            return False
+        try:
+            expected_w, expected_h, expected_l, expected_t = self._kofi_popup_geometry()
+            user32 = ctypes.windll.user32
+            target_pid = process.pid
+            tolerance = self._KOFI_MATCH_TOLERANCE
+            found = []
+
+            enum_proc = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+            def visit(hwnd, _lparam):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value != target_pid or not user32.IsWindowVisible(hwnd):
+                    return True
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    if (abs(rect.left - expected_l) <= tolerance
+                            and abs(rect.top - expected_t) <= tolerance
+                            and abs((rect.right - rect.left) - expected_w) <= tolerance
+                            and abs((rect.bottom - rect.top) - expected_h) <= tolerance):
+                        found.append(True)
+                return True
+
+            user32.EnumWindows(enum_proc(visit), 0)
+            return bool(found)
+        except Exception:
+            return False
+
+    # Give up waiting for the child after this long and drop the placeholder
+    # rather than leaving it stuck over the app.
+    _KOFI_READY_TIMEOUT_MS = 8000
+
+    def _cancel_kofi_ready_poll(self):
+        poll_id = getattr(self, "_kofi_ready_poll_id", None)
+        self._kofi_ready_poll_id = None
+        if poll_id:
+            try:
+                self.root.after_cancel(poll_id)
+            except Exception:
+                pass
+
+    def _poll_kofi_window_ready(self, deadline=None):
+        """Swap the placeholder out as soon as the real window is on screen."""
+        self._kofi_ready_poll_id = None
+        if getattr(self, "_kofi_placeholder", None) is None:
+            return
+        if deadline is None:
+            deadline = time.time() + self._KOFI_READY_TIMEOUT_MS / 1000.0
+        if self._kofi_child_window_in_place():
+            self._kofi_window_ready = True
+            self._hide_kofi_placeholder()
+            return
+        if time.time() >= deadline:
+            logger.debug("Ko-fi child window did not appear before the timeout.")
+            self._hide_kofi_placeholder()
+            return
+        try:
+            self._kofi_ready_poll_id = self.root.after(
+                50, lambda: self._poll_kofi_window_ready(deadline))
+        except Exception:
+            self._kofi_ready_poll_id = None
+
+    def _prewarm_kofi_window(self):
+        """Start the Ko-fi child while the pointer rests on the button.
+
+        The window is created parked off-screen and the page loads straight away,
+        so the click that usually follows only has to move it on-screen. Most of
+        the open cost is process start-up plus the page load, and hovering buys
+        enough time to absorb it. No-op when a child is already running, so a
+        user who never touches the button never pays for this.
+        """
+        process = getattr(self, "_kofi_process", None)
+        if process is not None and process.poll() is None:
+            return
+        self._spawn_kofi_window(prewarm=True)
+
+    def _spawn_kofi_window(self, prewarm=False):
+        """Launch the Ko-fi child process for the first time and show it.
+
+        With prewarm=True the child is started but left parked off-screen; the
+        window only appears when a later `show` command arrives.
+        """
+        self._close_kofi_window()
+        if not prewarm:
+            # Put something under the button before doing any of the slow work,
+            # so the click always produces a window immediately.
+            self._begin_kofi_placeholder_handoff()
+        try:
+            import subprocess
+            anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+            # Size the popup on the app's own scaling rule, and zoom the page by
+            # the same amount so the content scales with the window instead of
+            # just being cropped differently. physical px = design px * zoom * DPI,
+            # so zoom = scale / dpi_ratio makes design px land on `scale` px.
+            scale = self._kofi_scale(anchor_bottom_y)
+            zoom = scale / (self._kofi_root_dpi_ratio() or 1.0)
+            # Pin it for this child's lifetime; see _kofi_popup_geometry.
+            self._kofi_active_scale = scale
+            position_args = [
+                "--anchor-center-x", str(anchor_center_x),
+                "--anchor-bottom-y", str(anchor_bottom_y),
+                "--scale", f"{scale:.6f}",
+                "--zoom", f"{zoom:.6f}",
+            ]
+            if prewarm:
+                position_args.append("--prewarm")
+            # Own the popup to the main window so Windows always keeps it above
+            # the main window (a background child process cannot otherwise raise
+            # itself above the foreground app via SetWindowPos).
+            owner_hwnd = self.get_root_hwnd()
+            if owner_hwnd:
+                position_args += ["--owner-hwnd", str(int(owner_hwnd))]
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--show-kofi", *position_args]
+            else:
+                cmd = [
+                    sys.executable,
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py"),
+                    "--show-kofi",
+                    *position_args,
+                ]
+            flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            # stdin is our command channel for later hide/show/quit requests.
+            self._kofi_process = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, creationflags=flags
+            )
+            self._poll_kofi_process()
+            if prewarm:
+                # Nothing is on screen yet, so there is no popup to dismiss.
+                # Reuse the idle timer so a hover that never becomes a click
+                # still releases the child.
+                self._kofi_visible = False
+                self._schedule_kofi_idle_close()
+                return
+            self._kofi_visible = True
+            self._kofi_shown_at = time.time()
+            self._bind_kofi_outside_click()
+        except Exception as e:
+            self._close_kofi_window()
+            self._hide_kofi_placeholder()
+            logger.error(f"Failed to open Ko-fi webview window, falling back to browser: {e}")
+            try:
+                webbrowser.open("https://ko-fi.com/tagayama")
+            except Exception:
+                pass
+
+    def _send_kofi_command(self, command):
+        """Write a single command line to the Ko-fi child's stdin."""
+        process = getattr(self, "_kofi_process", None)
+        if process is None or process.poll() is not None or process.stdin is None:
+            return False
+        try:
+            process.stdin.write((command + "\n").encode("utf-8"))
+            process.stdin.flush()
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to send Ko-fi command '{command}': {e}")
+            return False
+
+    def _show_kofi_window(self):
+        """Reveal the already-loaded Ko-fi window under the button (no reload)."""
+        anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+        # A pre-warmed child that has not finished starting cannot show anything
+        # yet, so cover the gap exactly as a cold open does.
+        self._begin_kofi_placeholder_handoff()
+        if self._send_kofi_command(f"show {anchor_center_x} {anchor_bottom_y}"):
+            self._kofi_visible = True
+            self._kofi_shown_at = time.time()
+            self._cancel_kofi_idle_close()
+            self._bind_kofi_outside_click()
+        else:
+            # The child is gone (e.g. crashed); start a fresh one.
+            self._spawn_kofi_window()
+
+    def _hide_kofi_window(self):
+        """Hide the Ko-fi window but keep the process alive for the next open."""
+        self._send_kofi_command("hide")
+        self._hide_kofi_placeholder()
+        self._kofi_visible = False
+        # After staying hidden a while, fully close the child to free its
+        # resources; the next open re-spawns (and reloads) it.
+        self._schedule_kofi_idle_close()
+
+    # Auto-close the popup process after it has been hidden this long (ms).
+    _KOFI_IDLE_CLOSE_MS = 180000  # 3 minutes
+
+    def _schedule_kofi_idle_close(self):
+        self._cancel_kofi_idle_close()
+        try:
+            self._kofi_idle_close_id = self.root.after(
+                self._KOFI_IDLE_CLOSE_MS, self._close_kofi_window
+            )
+        except Exception:
+            self._kofi_idle_close_id = None
+
+    def _cancel_kofi_idle_close(self):
+        idle_id = getattr(self, "_kofi_idle_close_id", None)
+        self._kofi_idle_close_id = None
+        if idle_id:
+            try:
+                self.root.after_cancel(idle_id)
+            except Exception:
+                pass
+
+    def _reposition_kofi_window(self):
+        """Keep the popup anchored under its button as the main window moves."""
+        if not getattr(self, "_kofi_visible", False):
+            return
+        anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+        self._reposition_kofi_placeholder()
+        self._send_kofi_command(f"move {anchor_center_x} {anchor_bottom_y}")
+
+    def _close_kofi_window(self):
+        """Terminate the managed Ko-fi child and drop all popup state (on quit)."""
+        process = getattr(self, "_kofi_process", None)
+        self._kofi_process = None
+        self._kofi_visible = False
+        # The next open starts a new child, so its window is not ready any more
+        # and will be sized for wherever the button is by then.
+        self._kofi_window_ready = False
+        self._kofi_active_scale = None
+        self._hide_kofi_placeholder()
+        self._cancel_kofi_idle_close()
+        if process is not None and process.poll() is None:
+            try:
+                if process.stdin is not None:
+                    try:
+                        process.stdin.write(b"quit\n")
+                        process.stdin.flush()
+                    except Exception:
+                        pass
+                process.terminate()
+            except Exception as e:
+                logger.debug(f"Failed to close Ko-fi webview process: {e}")
+        self._unbind_kofi_outside_click()
+
+    def _click_on_kofi_button(self, button, event):
+        """DPI-safe test for whether a <ButtonPress> landed on the Ko-fi button.
+
+        Prefers Tk's own hit-testing (winfo_containing) at the click's screen
+        coordinates, which stays correct under per-monitor DPI scaling where the
+        manual winfo_* vs event-coordinate rectangle math can disagree. Walks up
+        the widget's parents so a click on any child of the button still counts.
+        Falls back to the bounding-box check if hit-testing is unavailable.
+        """
+        if button is None or not button.winfo_exists():
+            return False
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            widget = None
+        walker = widget
+        while walker is not None:
+            if walker is button:
+                return True
+            walker = getattr(walker, "master", None)
+        return self._event_in_widget(button, event)
+
+    def _unbind_kofi_outside_click(self):
+        bind_id = getattr(self, "_kofi_outside_click_bind_id", None)
+        self._kofi_outside_click_bind_id = None
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except Exception:
+                pass
+
+    def _bind_kofi_outside_click(self):
+        """Make Ko-fi behave like an in-window popup owned by its header button.
+
+        Bound once and left in place for the popup's lifetime (unbound in
+        _close_kofi_window). The handler consults the live visibility state and a
+        short grace period, so the click that *opens* the popup can never be
+        misjudged as an outside click and immediately hide it — even when clicking
+        the button first activates the main window and the coordinates are scaled
+        by DPI awareness.
+        """
+        if getattr(self, "_kofi_outside_click_bind_id", None):
+            return
+
+        def hide_on_other_main_window_click(event):
+            # Nothing to dismiss unless the popup is currently shown.
+            if not getattr(self, "_kofi_visible", False):
+                return
+            # Clicking the Ko-fi button (or anything inside it) must never close
+            # the popup. Use Tk's own hit-testing (winfo_containing) as the
+            # primary check because manual rect math with winfo_* vs event coords
+            # can disagree under per-monitor DPI scaling; keep the rect check as a
+            # fallback.
+            button = getattr(self, "kofi_button", None)
+            if self._click_on_kofi_button(button, event):
+                return
+            self._hide_kofi_window()
+
+        self._kofi_outside_click_bind_id = self.root.bind(
+            "<ButtonPress>", hide_on_other_main_window_click, add="+"
+        )
+
+    def _poll_kofi_process(self):
+        """Clear stale state if the WebView is closed externally (for example Alt+F4)."""
+        process = getattr(self, "_kofi_process", None)
+        if process is None:
+            return
+        if process.poll() is not None:
+            self._close_kofi_window()
+            return
+        self.root.after(500, self._poll_kofi_process)
 
     def update_header_status(self):
         if not hasattr(self, 'header_label'):
@@ -3597,8 +5199,16 @@ class ControllerWindow:
                 conn_status = "Ready"
                 status_color = "#55CC55"
             else:
-                conn_status = "Disconnect"
-                status_color = "#888888"
+                # No Bluetooth radio (or it was switched off): the app keeps running in
+                # wired-only mode, so report the USB route rather than a bare "Disconnect"
+                # that made it look like nothing could connect at all.
+                conn_method = "USB"
+                if getattr(self, 'wired_pro2_detected', False):
+                    conn_status = "USB Connected"
+                    status_color = "#55CC55"
+                else:
+                    conn_status = "Pending USB Connection"
+                    status_color = "#888888"
 
         self.header_label.config(
             text=f"Connecting Via: {conn_method}  |  Status: {conn_status}",
@@ -3638,48 +5248,73 @@ class ControllerWindow:
         if not hasattr(self, 'driver_btn') or not self.driver_btn:
             return
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        # Only a genuinely half-installed driver offers "Repair"; VIGEMBUS_UNKNOWN /
+        # WINUHID_UNKNOWN must fall through to "Install", which is idempotent (the
+        # install script cleans up first) and cannot dead-end like repair does.
         if driver_type == "ViGEmBus":
-            installed = getattr(CONFIG, 'vigembus_installed', False)
-            text = "Uninstall ViGEmBus Driver" if installed else "Download ViGEmBus Driver"
+            vigem_state = get_vigembus_status(use_cache=True).state
+            text = ("Uninstall ViGEmBus Driver" if vigem_state == VIGEMBUS_HEALTHY
+                    else "Repair ViGEmBus Driver" if vigem_state == VIGEMBUS_PARTIAL
+                    else "Install ViGEmBus Driver")
         else:
-            installed = getattr(CONFIG, 'driver_installed', False)
-            text = "Uninstall WinUHid Driver" if installed else "Install WinUHid Driver"
+            winuhid_state = get_winuhid_status(use_cache=True).state
+            text = ("Uninstall WinUHid Driver" if winuhid_state == WINUHID_HEALTHY
+                    else "Repair WinUHid Driver" if winuhid_state == WINUHID_PARTIAL
+                    else "Install WinUHid Driver")
         self.driver_btn.config(text=text)
         self.update_driver_buttons_visibility()
 
     def update_usbip_button(self):
         if not hasattr(self, 'usbip_btn') or not self.usbip_btn:
             return
-        usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-        text = "Uninstall USBIP Driver" if os.path.exists(usbip_exe) else "Install USBIP Driver"
+        # Only a genuinely half-installed driver offers "Repair"; USBIP_UNKNOWN
+        # falls through to "Install", which cleans up first and cannot dead-end.
+        usbip_state = get_usbip_status(use_cache=True).state
+        text = ("Uninstall USBIP Driver" if usbip_state == USBIP_HEALTHY
+                else "Repair USBIP Driver" if usbip_state == USBIP_PARTIAL
+                else "Install USBIP Driver")
         self.usbip_btn.config(text=text)
         self.update_driver_buttons_visibility()
 
     def on_usbip_btn_clicked(self):
-        usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-        if os.path.exists(usbip_exe):
+        install_warning = (
+            "WARNING: During the installation of USBIP-win2, Windows USB hubs will restart briefly, "
+            "which will temporarily disconnect other USB peripherals (mice, keyboards, etc.).\n\n"
+            "Do you want to proceed?\n(Requires administrator privileges.)"
+        )
+        status = get_usbip_status()
+        if status.state == USBIP_HEALTHY:
             if self.ask_centered_yes_no("Uninstall USBIP Driver", "Are you sure you want to uninstall the USBIP driver?\n(Requires administrator privileges.)"):
                 self.run_usbip_uninstall()
+        elif status.state == USBIP_PARTIAL:
+            if self.ask_centered_yes_no(
+                "Repair USBIP Driver",
+                "USBIP is partially installed. Clean up the broken installation and reinstall it?\n\n"
+                f"{status.describe()}\n\n{install_warning}"
+            ):
+                if self.run_usbip_uninstall():
+                    self.run_usbip_install()
         else:
+            if status.unknown:
+                logger.warning("USBIP status undetermined: %s", status.describe())
             if self.ask_centered_yes_no(
                 "Install USBIP Driver",
-                "Are you sure you want to install the USBIP driver?\n\n"
-                "WARNING: During the installation of USBIP-win2, Windows USB hubs will restart briefly, which will temporarily disconnect other USB peripherals (mice, keyboards, etc.).\n\n"
-                "Do you want to proceed?\n(Requires administrator privileges.)"
+                "Are you sure you want to install the USBIP driver?\n\n" + install_warning
             ):
                 self.run_usbip_install()
 
     def run_usbip_install(self, show_success_msg=True):
+        # Install USBIP from the bundled installer (both builds); nothing downloaded.
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before installation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
             discoverer_was_running = True
             self.stop_discoverer_thread()
-            
+
         # Run emergency cleanup to close all virtual controller handles immediately
         from discoverer import emergency_cleanup
         emergency_cleanup()
@@ -3706,18 +5341,8 @@ class ControllerWindow:
                 label.pack(pady=int(40 * scaling_factor))
                 
                 # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = "powershell.exe"
-                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{install_ps1}"'
-                info.lpDirectory = None
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(install_ps1), progress_win=progress_win)
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3725,8 +5350,7 @@ class ControllerWindow:
                     if discoverer_was_running:
                         self.start_discoverer_thread()
                     return
-                
-                hProcess = info.hProcess
+
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3750,15 +5374,19 @@ class ControllerWindow:
                 
                 logger.info(f"USBIP driver installer process exited with code: {proc_exit_code[0]}")
                 
-                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-                usbip_installed_ok = os.path.exists(usbip_exe)
+                invalidate_driver_status_cache("usbip")
+                usbip_status = get_usbip_status()
+                usbip_installed_ok = usbip_status.installed or (
+                    usbip_status.unknown
+                    and os.path.exists("C:\\Program Files\\USBip\\usbip.exe"))
                 if usbip_installed_ok:
                     if show_success_msg:
                         self.show_centered_message("Success", "USBIP-win2 driver installed successfully.")
                 else:
                     self.show_centered_message(
                         "Error",
-                        "USBIP driver installation was not completed or failed."
+                        "USBIP driver installation was not completed or failed.\n\n"
+                        f"Exit code: {proc_exit_code[0]}\n{usbip_status.describe()}"
                     )
                 self.update_usbip_button()
             except Exception as e:
@@ -3769,11 +5397,85 @@ class ControllerWindow:
         if discoverer_was_running:
             self.start_discoverer_thread()
 
+    def _run_usbip_cleanup_script(self):
+        """Run the bundled uninstall_usbip.ps1 elevated. Returns its exit code or None.
+
+        This is the manual-cleanup path (detach, device node, Driver Store, files).
+        It used to be unreachable in the standalone build, which meant a USBIP
+        install whose unins000.exe had gone missing could never be removed.
+        """
+        cleanup_ps1 = get_driver_path("uninstall_usbip.ps1")
+        if not os.path.exists(cleanup_ps1):
+            return None
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("USBIP Driver Cleanup")
+        progress_win.resizable(False, False)
+        progress_win.config(bg="#1E1E1E")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        self.center_window_on_root(
+            progress_win, int(450 * scaling_factor), int(130 * scaling_factor))
+        tk.Label(
+            progress_win,
+            text="Cleaning up USBIP driver components...\nPlease authorize the UAC prompt if asked.",
+            fg="white", bg="#1E1E1E", font=scale_font(("Arial", 11, "bold"))
+        ).pack(pady=int(40 * scaling_factor))
+
+        hProcess = self._launch_elevated(
+            "powershell.exe", self._ps_hidden_args(cleanup_ps1), progress_win=progress_win)
+        if not hProcess:
+            progress_win.grab_release()
+            progress_win.destroy()
+            return None
+
+        proc_exit_code = [None]
+
+        def check_process():
+            res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+            if res == WAIT_TIMEOUT:
+                progress_win.after(200, check_process)
+            else:
+                exit_code = wintypes.DWORD()
+                ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                ctypes.windll.kernel32.CloseHandle(hProcess)
+                proc_exit_code[0] = exit_code.value
+                progress_win.grab_release()
+                progress_win.destroy()
+
+        progress_win.after(200, check_process)
+        self.root.wait_window(progress_win)
+        logger.info("USBIP cleanup script exited with code: %s", proc_exit_code[0])
+        return proc_exit_code[0]
+
+    @staticmethod
+    def _read_usbip_uninstall_log():
+        log_path = os.path.join(os.environ.get("TEMP", ""), "Switch2Connect_USBIP_uninstall.log")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+                lines = stream.read().strip().splitlines()
+            keywords = ("error", "failed", "incomplete", "unavailable", "verification")
+            important = [line for line in lines if any(word in line.lower() for word in keywords)]
+            summary = important[-12:] if important else lines[-12:]
+            return "\n".join(summary)[-1400:]
+        except Exception:
+            return "Cleanup log was not available."
+
+    def _usbip_removal_verified(self):
+        invalidate_driver_status_cache("usbip")
+        status = get_usbip_status()
+        if status.absent:
+            return True, status
+        if status.unknown:
+            # Fall back to the executable the rest of the app actually invokes.
+            return not os.path.exists("C:\\Program Files\\USBip\\usbip.exe"), status
+        return False, status
+
     def run_usbip_uninstall(self):
+        # Uninstall from the bundled uninstaller/script (both builds); nothing downloaded.
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before uninstallation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
@@ -3805,19 +5507,11 @@ class ControllerWindow:
                 )
                 label.pack(pady=int(40 * scaling_factor))
                 
-                # Bypassing CMD and launching the uninstaller directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = uninstaller_exe
-                info.lpParameters = ""
-                info.lpDirectory = "C:\\Program Files\\USBip"
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                # Run the Inno Setup uninstaller silently (no window) via the elevated helper.
+                hProcess = self._launch_elevated(
+                    uninstaller_exe, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                    progress_win=progress_win, lp_dir="C:\\Program Files\\USBip")
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3826,7 +5520,6 @@ class ControllerWindow:
                         self.start_discoverer_thread()
                     return
 
-                hProcess = info.hProcess
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3849,21 +5542,37 @@ class ControllerWindow:
                 self.root.wait_window(progress_win)
                 
                 logger.info(f"USBIP driver uninstaller process exited with code: {proc_exit_code[0]}")
-                
-                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-                usbip_removed_ok = not os.path.exists(usbip_exe)
-                if usbip_removed_ok:
-                    self.show_centered_message("Success", "USBIP driver uninstalled successfully.")
-                else:
-                    self.show_centered_message("Information", "USBIP driver uninstaller closed.")
-                self.update_usbip_button()
             except Exception as e:
                 self.show_centered_message("Error", f"Failed to start the USBIP uninstaller: {e}")
         else:
-            self.show_centered_message("Error", f"Could not find uninstaller at {uninstaller_exe}.")
+            logger.warning("USBIP uninstaller missing at %s; using the cleanup script.", uninstaller_exe)
+
+        # The vendor uninstaller only removes what it installed, and it may be
+        # missing entirely on a broken install. Fall back to the cleanup script,
+        # which removes the device node, Driver Store packages and files itself.
+        usbip_removed_ok, status = self._usbip_removal_verified()
+        if not usbip_removed_ok:
+            cleanup_code = self._run_usbip_cleanup_script()
+            if cleanup_code is None:
+                self.show_centered_message(
+                    "Error",
+                    "Could not run the USBIP cleanup script.\n\n"
+                    f"{status.describe()}")
+            else:
+                usbip_removed_ok, status = self._usbip_removal_verified()
+
+        if usbip_removed_ok:
+            self.show_centered_message("Success", "USBIP driver uninstalled successfully.")
+        else:
+            self.show_centered_message(
+                "Error",
+                "USBIP uninstallation failed or left components behind.\n\n"
+                f"{status.describe()}\n\nCleanup details:\n{self._read_usbip_uninstall_log()}")
+        self.update_usbip_button()
 
         if discoverer_was_running:
             self.start_discoverer_thread()
+        return usbip_removed_ok
 
 
     def init_interface(self):
@@ -3902,12 +5611,9 @@ class ControllerWindow:
             photo = tk.PhotoImage(file=get_resource('images/icon.png'))
             self.root.wm_iconphoto(False, photo)
         except: pass
-        import sys
-        exe_name = os.path.basename(sys.argv[0])
-        if exe_name.lower().endswith('.exe'):
-            self.root.title(os.path.splitext(exe_name)[0])
-        else:
-            self.root.title(f"Switch 2 Connect")
+        # Window title is always the branded name (the executable file name stays
+        # Switch2Connect.exe; the MSIX Store DisplayName is also "Switch 2 Connect").
+        self.root.title("Switch 2 Connect")
         
         # 3. Handle window geometry & minsize (remembering position)
         default_w = int(1270 * window_resolution_ratio)
@@ -4072,9 +5778,46 @@ class ControllerWindow:
         )
         self.header_label.pack(side=tk.RIGHT, padx=int(12 * scaling_factor), fill=tk.Y)
 
+        # Ko-fi donation button — centered in the header, vertically aligned with
+        # the header text. Placed on the root (not packed) so it stays independent
+        # and never displaces the version/status labels. Its height is 1.5× the
+        # header height (24 -> 36), so it slightly overflows the header bar.
+        try:
+            kofi_target_h = int(30 * scaling_factor)  # half of the previous 1.5× header height
+            kofi_img = Image.open(get_resource("images/support_me_on_kofi_dark.png"))
+            _kw, _kh = kofi_img.size
+            kofi_target_w = max(1, int(round(_kw * (kofi_target_h / _kh))))
+            kofi_img = kofi_img.resize(
+                (kofi_target_w, kofi_target_h),
+                Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS,
+            )
+            self.kofi_image = ImageTk.PhotoImage(kofi_img)
+            self.kofi_button = tk.Label(
+                self.root,
+                image=self.kofi_image,
+                bg=background_color,
+                cursor="hand2",
+                borderwidth=0,
+                highlightthickness=0,
+            )
+            # Centered horizontally; vertically centered on the header text.
+            self.kofi_button.place(relx=0.5, y=int(12 * scaling_factor), anchor=tk.CENTER)
+            self.kofi_button.bind("<Button-1>", lambda e: self._open_kofi_window())
+            # Start the popup process on hover so the click that follows is
+            # near-instant. add="+" because the tooltip helper also binds <Enter>.
+            self.kofi_button.bind(
+                "<Enter>", lambda e: self._prewarm_kofi_window(), add="+")
+        except Exception as e:
+            logger.error(f"Failed to load/scale Ko-fi button image: {e}")
+
         self.main_frame = tk.Frame(self.root, bg=background_color)
         self.main_frame.pack(side=tk.TOP, pady=(10, 5), fill=tk.Y)
         self.players_info = None
+
+        # Keep the Ko-fi button on top so its slight overflow below the header
+        # bar is not hidden behind subsequently-packed frames.
+        if hasattr(self, 'kofi_button'):
+            self.kofi_button.lift()
 
         self.init_settings_panel()
         self.init_compensation_panel(parent=self.tab_content_frame)
@@ -4097,11 +5840,12 @@ class ControllerWindow:
         self.usbip_btn = tk.Button(self.usbip_frame, text="", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), command=self.on_usbip_btn_clicked)
         self.usbip_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
-        # Wired Pro Controller Button
+        # Wired controller settings button (re-labelled per connected pad by
+        # update_driver_buttons_visibility).
         self.wired_pro_settings_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
         self.wired_pro_settings_btn = tk.Button(
             self.wired_pro_settings_frame,
-            text="Wired Pro Controller",
+            text=self.wired_controller_label(),
             bg=button_gray,
             fg=text_color,
             bd=0,
@@ -4125,11 +5869,11 @@ class ControllerWindow:
         )
         self.esp32s3_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
-        # Wired Pro Controller 2 Driver Button (only shown when detected)
+        # Wired controller driver button (only shown when detected)
         self.hidhide_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
         self.hidhide_btn = tk.Button(
             self.hidhide_frame,
-            text="Wired Pro Controller 2 Driver",
+            text=f"{self.wired_controller_label()} Driver",
             bg=button_gray,
             fg=text_color,
             bd=0,
@@ -4183,11 +5927,43 @@ class ControllerWindow:
             return lst
             
         def spatial_navigate(current_widget, direction):
-            widgets = get_focusable_widgets(self.root)
+            # Modal scoping: a grabbed dialog Toplevel wins over Frame popups; while either
+            # is open restrict navigation to it so focus can't escape into the main window.
+            _dialog = self._nav_top_dialog()
+            in_dialog = _dialog is not None
+            if in_dialog:
+                # FocusOutline draws on self.root (behind the Toplevel), so use native
+                # focus_set for every dialog widget instead.
+                widgets = get_focusable_widgets(_dialog)
+            else:
+                _attr, _top_frame, _top_anchor = self._nav_top_popup()
+                if _top_frame is not None:
+                    widgets = get_focusable_widgets(_top_frame)
+                    if isinstance(_top_anchor, tk.Widget):
+                        try:
+                            if (_top_anchor.winfo_exists() and _top_anchor.winfo_ismapped()
+                                    and _top_anchor not in widgets):
+                                widgets.append(_top_anchor)
+                        except Exception:
+                            pass
+                else:
+                    widgets = get_focusable_widgets(self.root)
             if not widgets: return
-            
+
+            def _select(target):
+                if isinstance(target, tk.Button) and not in_dialog:
+                    self.root.focus_set()
+                    try: self.focus_outline.update(target)
+                    except Exception: pass
+                else:
+                    target.focus_set()
+
             if not current_widget or current_widget not in widgets:
-                widgets[0].focus_set()
+                # Resume at the position we exited from (change: re-entry starts where the
+                # user last left off), falling back to the first widget if it's gone.
+                resume = getattr(self, "_nav_last_widget", None)
+                target = resume if (isinstance(resume, tk.Widget) and resume.winfo_exists() and resume in widgets) else widgets[0]
+                _select(target)
                 return
 
             cx = current_widget.winfo_rootx() + current_widget.winfo_width() / 2
@@ -4240,15 +6016,10 @@ class ControllerWindow:
                     best_widget = col_candidates[0][0]
 
             if best_widget:
-                if isinstance(best_widget, tk.Button):
-                    # For standard buttons, remove native focus to hide the dashed outline
-                    # but manually trigger the outline so it remains visually targeted.
-                    self.root.focus_set()
-                    try:
-                        self.focus_outline.update(best_widget)
-                    except: pass
-                else:
-                    best_widget.focus_set()
+                # For standard buttons (outside a dialog), hide the native dashed focus and
+                # draw the FocusOutline instead; in a dialog, use native focus (the outline
+                # would be hidden behind the Toplevel).
+                _select(best_widget)
 
         self.focus_outline = FocusOutline(self.root)
 
@@ -4270,9 +6041,17 @@ class ControllerWindow:
         def poll_ui_navigation():
             if not getattr(self, 'root', None) or not self.root.winfo_exists():
                 return
-            
+
             self.root.after(50, poll_ui_navigation)
-            
+
+            # Flush the deferred gamepad-edit save once the numeric hold has stopped. Runs
+            # every tick (before the focus/state guards below) so suppression never sticks.
+            import time as _flush_time
+            if getattr(self, "_nav_save_suppressed", False) and (_flush_time.time() - getattr(self, "_nav_num_last_active", 0.0)) > self.NUM_REPEAT_RELEASE_GAP:
+                self._nav_save_suppressed = False
+                try: CONFIG.suppress_saves(False)
+                except Exception: pass
+
             if getattr(self, 'recording_controllers', False):
                 return
 
@@ -4309,7 +6088,18 @@ class ControllerWindow:
             if not hasattr(self, 'debug_print_count'): self.debug_print_count = 0
                 
             if not hasattr(self, 'nav_last_right_time'): self.nav_last_right_time = 0
-                
+
+            # A modal dialog (grabbed Toplevel, e.g. the reset-confirm) is open: pull
+            # gamepad control into it and make sure one of its buttons is selected.
+            _dlg = self._nav_top_dialog()
+            if _dlg is not None:
+                self.ui_navigation_active = True
+                _dfocused = safe_focus_get()
+                _dbtns = get_focusable_widgets(_dlg)
+                if _dbtns and (not isinstance(_dfocused, tk.Widget) or _dfocused not in _dbtns):
+                    try: _dbtns[0].focus_set()
+                    except Exception: pass
+
             nav_dir = None
             right_nav_dir = None
             click_pressed = False
@@ -4321,8 +6111,11 @@ class ControllerWindow:
             right_mask = SWITCH_BUTTONS.get("RIGHT", 0x00040000)
             a_mask = SWITCH_BUTTONS.get("A", 0x00000008) # Physical A button (Right)
             b_mask = SWITCH_BUTTONS.get("B", 0x00000004) # Physical B button (Down)
-            
-            from config import CONFIG
+
+            # NOTE: CONFIG is the module-level import (top of file). Do NOT re-import it
+            # locally here -- a local `from config import CONFIG` would make CONFIG a local
+            # for the whole function, breaking the earlier flush (UnboundLocalError) and
+            # leaving save suppression stuck on.
             if getattr(CONFIG, 'abxy_mode', 'Switch') == 'Xbox':
                 click_mask = b_mask
                 cancel_mask = a_mask
@@ -4434,10 +6227,50 @@ class ControllerWindow:
             if cancel_pressed and self.ui_navigation_active and current_time - self.nav_last_cancel_time > 0.3:
                 self.nav_last_cancel_time = current_time
                 self.nav_last_click_time = current_time # Sync
-                self.ui_navigation_active = False
-                if hasattr(self, 'focus_outline'):
-                    self.focus_outline.hide()
-                self.root.focus_set()
+                _dlg_b = self._nav_top_dialog()
+                if _dlg_b is not None:
+                    # Close the modal dialog (destroy releases the grab; both dialog helpers
+                    # return their safe default -> treated as cancel). Stay in control mode.
+                    try: _dlg_b.destroy()
+                    except Exception: pass
+                elif self._nav_close_top_popup():
+                    pass  # closed the top-most floating window; stay in UI-control mode
+                else:
+                    # True exit: remember the current selection so re-entry resumes here.
+                    self._nav_last_widget = (getattr(self.focus_outline, "target_widget", None) or safe_focus_get())
+                    self.ui_navigation_active = False
+                    if hasattr(self, 'focus_outline'):
+                        self.focus_outline.hide()
+                    self.root.focus_set()
+
+            # Numeric text entries use an independent accelerating hold-to-repeat (not the
+            # fixed 0.2s throttle). Intercept here and consume the direction so the throttled
+            # blocks below don't also adjust the entry or move focus off it.
+            if self.ui_navigation_active:
+                _nfocus = safe_focus_get()
+                if (not _nfocus or _nfocus == self.root) and getattr(getattr(self, "focus_outline", None), "target_widget", None):
+                    _nfocus = self.focus_outline.target_widget
+                _nup = None
+                if self._is_numeric_entry(_nfocus):
+                    if right_nav_dir:
+                        _nup = right_nav_dir in ("UP", "RIGHT")
+                    elif nav_dir and click_pressed:
+                        _nup = nav_dir in ("UP", "RIGHT")
+                if _nup is not None:
+                    # Defer disk saves while actively adjusting; flush once on release (top
+                    # of poll). In-memory value + settings_generation still update, so the
+                    # runtime effect is immediate -- only the frequent disk write is coalesced.
+                    self._nav_num_last_active = current_time
+                    if not getattr(self, "_nav_save_suppressed", False):
+                        try: CONFIG.suppress_saves(True)
+                        except Exception: pass
+                        self._nav_save_suppressed = True
+                    if self._nav_numeric_hold_should_step(_nfocus, _nup, current_time):
+                        self._nav_adjust_numeric_entry(_nfocus, _nup)
+                    if right_nav_dir:
+                        right_nav_dir = None
+                    if nav_dir and click_pressed:
+                        nav_dir = None
 
             if nav_dir and current_time - self.nav_last_move_time > 0.2:
                 self.nav_last_move_time = current_time
@@ -4446,30 +6279,18 @@ class ControllerWindow:
                 if (not focused or focused == self.root) and hasattr(self, 'focus_outline') and self.focus_outline.target_widget:
                     focused = self.focus_outline.target_widget
                 
-                if click_pressed and (isinstance(focused, tk.Scale) or getattr(focused, 'is_time_entry', False)):
-                    if getattr(focused, 'is_time_entry', False):
-                        try:
-                            val = int(focused.get() or 0)
-                            if nav_dir in ("UP", "RIGHT"):
-                                val += 1
-                            else:
-                                val -= 1
-                            if val < 0: val = 0
-                            focused.delete(0, tk.END)
-                            focused.insert(0, str(val))
-                            if hasattr(self, 'on_auto_disconnect_time_changed'):
-                                self.on_auto_disconnect_time_changed()
-                        except: pass
-                    else:
-                        try:
-                            val = float(focused.get())
-                            res = float(focused.cget('resolution')) or 1.0
-                            if nav_dir in ("UP", "RIGHT"):
-                                val += res
-                            else:
-                                val -= res
-                            focused.set(val)
-                        except: pass
+                if click_pressed and isinstance(focused, tk.Scale):
+                    try:
+                        val = float(focused.get())
+                        res = float(focused.cget('resolution')) or 1.0
+                        if nav_dir in ("UP", "RIGHT"):
+                            val += res
+                        else:
+                            val -= res
+                        focused.set(val)
+                    except: pass
+                elif click_pressed and isinstance(focused, tk.Entry) and self._nav_adjust_numeric_entry(focused, nav_dir in ("UP", "RIGHT")):
+                    pass
                 else:
                     spatial_navigate(focused, nav_dir)
                 
@@ -4480,19 +6301,8 @@ class ControllerWindow:
                     focused = self.focus_outline.target_widget
                 
                 if focused:
-                    if getattr(focused, 'is_time_entry', False):
-                        try:
-                            val = int(focused.get() or 0)
-                            if right_nav_dir in ("UP", "RIGHT"):
-                                val += 1
-                            else:
-                                val -= 1
-                            if val < 0: val = 0
-                            focused.delete(0, tk.END)
-                            focused.insert(0, str(val))
-                            if hasattr(self, 'on_auto_disconnect_time_changed'):
-                                self.on_auto_disconnect_time_changed()
-                        except: pass
+                    if isinstance(focused, tk.Entry):
+                        self._nav_adjust_numeric_entry(focused, right_nav_dir in ("UP", "RIGHT"))
                     elif isinstance(focused, tk.Scale):
                         try:
                             val = float(focused.get())
@@ -4538,6 +6348,10 @@ class ControllerWindow:
                             focused.invoke()
                         except:
                             pass
+                    elif isinstance(focused, tk.Entry):
+                        # A on a text entry must NOT type a space (numeric entries are
+                        # adjusted via A+direction / right-stick instead). No-op.
+                        pass
                     else:
                         try:
                             focused.event_generate('<space>')
@@ -4576,6 +6390,12 @@ class ControllerWindow:
                         self.last_y = ry
             except Exception:
                 pass
+            # Keep the Ko-fi popup glued under its button as the window moves.
+            if getattr(self, "_kofi_visible", False):
+                try:
+                    self._reposition_kofi_window()
+                except Exception:
+                    pass
 
     def init_compensation_panel(self, parent=None):
         parent = parent or self.root
@@ -4684,13 +6504,26 @@ bg_color=panel_bg, widths=[8, 10])
         
         self.djg_dominant_label = tk.Label(self.djg_frame, text="Dominant Side:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold")))
         self.djg_dominant_label.grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
-        self.djg_dominant_switch = ToggleSwitch(self.djg_frame, labels=["Left", "Right"], values=["Left", "Right"], initial_value=getattr(CONFIG, "djg_dominant_side", "Left"), command=self.update_djg_dominant_setting, bg_color=panel_bg)
+        djg_dominant = getattr(CONFIG, "djg_dominant_side", "Right")
+        self.djg_dominant_switch = ToggleSwitch(
+            self.djg_frame, labels=["Left", "Right"], values=["Left", "Right"],
+            initial_value=djg_dominant if djg_dominant in ("Left", "Right") else "Right",
+            command=self.update_djg_dominant_setting, bg_color=panel_bg)
         self.djg_dominant_switch.grid(row=0, column=4, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+        self.djg_dominant_var = tk.StringVar(value=djg_dominant)
+        self.djg_dominant_combo = ttk.Combobox(
+            self.djg_frame, textvariable=self.djg_dominant_var,
+            values=["Left", "Right", "None"], state="readonly",
+            font=scale_font(("Arial", 11, "bold")), width=6, justify="center")
+        self.djg_dominant_combo.grid(row=0, column=4, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+        self.djg_dominant_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.update_djg_dominant_setting(self.djg_dominant_var.get()))
         
         tk.Label(self.djg_frame, text="Mode:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         
         self.djg_mode_var = tk.StringVar(value=getattr(CONFIG, "djg_mode", "Single Side Toggle"))
-        djg_modes = ["Single Side Toggle", "Switch Dominant Side", "Switch Gyro Side", "Direct Merge"]
+        djg_modes = ["Switch Dominant Side", "Switch Gyro Side", "Single Side Toggle"]
         
         # Calculate max width for dropdown
         max_mode_len = max(len(m) for m in djg_modes)
@@ -4710,20 +6543,19 @@ bg_color=panel_bg, widths=[8, 10])
     def _apply_djg_mode_ui_state(self):
         if not hasattr(self, 'djg_mode_var'):
             return
-        direct_merge = self.djg_mode_var.get() == "Direct Merge"
-        widgets = [
-            getattr(self, "djg_dominant_label", None),
-            getattr(self, "djg_dominant_switch", None),
-            getattr(self, "djg_activation_label", None),
-            getattr(self, "djg_activation_switch", None),
-        ]
-        for widget in widgets:
-            if widget is None:
-                continue
-            if direct_merge:
-                widget.grid_remove()
+        single_side_toggle = self.djg_mode_var.get() == "Single Side Toggle"
+        dominant_combo = getattr(self, "djg_dominant_combo", None)
+        dominant_switch = getattr(self, "djg_dominant_switch", None)
+        if dominant_combo is not None:
+            if single_side_toggle:
+                dominant_combo.grid()
             else:
-                widget.grid()
+                dominant_combo.grid_remove()
+        if dominant_switch is not None:
+            if single_side_toggle:
+                dominant_switch.grid_remove()
+            else:
+                dominant_switch.grid()
 
     def _update_djg_panel_visibility(self):
         if not hasattr(self, 'djg_frame'):
@@ -4746,17 +6578,27 @@ bg_color=panel_bg, widths=[8, 10])
         logger.info(f"DJG Activation: {val}")
 
     def update_djg_mode_setting(self, val):
-        CONFIG.djg_mode = val
+        legacy_direct_merge = val == "Direct Merge"
+        if legacy_direct_merge:
+            # The config setter performs the atomic legacy migration so None is
+            # not rejected against the previously selected non-Single mode.
+            CONFIG.djg_mode = "Direct Merge"
+            val = CONFIG.djg_mode
+            if hasattr(self, "djg_dominant_var"):
+                self.djg_dominant_var.set(CONFIG.djg_dominant_side)
+        elif val != "Single Side Toggle" and getattr(CONFIG, "djg_dominant_side", "Right") == "None":
+            CONFIG.djg_dominant_side = "Right"
+            if hasattr(self, "djg_dominant_var"):
+                self.djg_dominant_var.set("Right")
+            if hasattr(self, "djg_dominant_switch"):
+                self.djg_dominant_switch.set_value("Right")
+        if not legacy_direct_merge:
+            CONFIG.djg_mode = val
         CONFIG.save_config()
         logger.info(f"DJG Mode: {val}")
         if hasattr(self, "djg_mode_var"):
             self.djg_mode_var.set(val)
         self._apply_djg_mode_ui_state()
-        if val == "Direct Merge":
-            for vc in VIRTUAL_CONTROLLERS:
-                if vc and len(getattr(vc, "controllers", [])) == 2:
-                    for c in vc.controllers:
-                        c.gyro_active = True
         self.force_refresh_player_slots()
 
 
@@ -4764,25 +6606,29 @@ bg_color=panel_bg, widths=[8, 10])
         CONFIG.djg_enabled = val
         CONFIG.save_config()
         logger.info(f"DJG Enabled: {val}")
-        if val and getattr(CONFIG, "djg_mode", "Single Side Toggle") == "Direct Merge":
-            for vc in VIRTUAL_CONTROLLERS:
-                if vc and len(getattr(vc, "controllers", [])) == 2:
-                    for c in vc.controllers:
-                        c.gyro_active = True
-        elif not val:
+        if not val:
             for vc in VIRTUAL_CONTROLLERS:
                 if vc:
-                    vc.active_gyro_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                    side = getattr(CONFIG, "djg_dominant_side", "Right")
+                    vc.active_gyro_side = side if side in ("Left", "Right") else "Right"
         self.force_refresh_player_slots()
 
     def update_djg_dominant_setting(self, val):
+        if val not in ("Left", "Right", "None"):
+            val = "Right"
+        if val == "None" and getattr(CONFIG, "djg_mode", "Single Side Toggle") != "Single Side Toggle":
+            val = "Right"
+        if hasattr(self, "djg_dominant_var"):
+            self.djg_dominant_var.set(val)
+        if val in ("Left", "Right") and hasattr(self, "djg_dominant_switch"):
+            self.djg_dominant_switch.set_value(val)
         CONFIG.djg_dominant_side = val
         CONFIG.save_config()
         logger.info(f"DJG Dominant Side: {val}")
         if not getattr(CONFIG, "djg_enabled", False):
             for vc in VIRTUAL_CONTROLLERS:
                 if vc:
-                    vc.active_gyro_side = val
+                    vc.active_gyro_side = val if val in ("Left", "Right") else "Right"
         else:
             mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
             if mode == "Switch Dominant Side":
@@ -5011,6 +6857,9 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.sync_active_in_app_gyro_activation()
         CONFIG.save_config()
         self._refresh_mapping_comboboxes()
+        # The Joy-con IR Sensor 'function' is cross-synced by the toggle too; refresh
+        # its buttons so both the base and Mode Shift labels reflect the new state.
+        self.refresh_joycon_ir_sensor_buttons()
 
     def _current_gyro_control_sensitivity(self):
         if getattr(CONFIG, "gyro_control_mode", "Mouse") == "R Joystick":
@@ -5047,6 +6896,9 @@ bg_color=panel_bg, widths=[8, 10])
         CONFIG.sync_active_in_app_gyro_activation()
         CONFIG.save_config()
         self._refresh_mapping_comboboxes()
+        # The active In-app Gyro scope changed with the mode; refresh the IR buttons
+        # so their labels reflect the reconciled function for the selected mode.
+        self.refresh_joycon_ir_sensor_buttons()
 
     def _update_gyro_control_visibility(self, val):
         self._current_gyro_control_ui_value = val
@@ -5157,7 +7009,8 @@ bg_color=panel_bg, widths=[8, 10])
     def _mapping_attr(self, key, suffix):
         return f"{key}{suffix}"
 
-    def start_custom_recording(self, key, entry, combo, custom_frame, mode_var, mapping_scope=None, prefix=None):
+    def start_custom_recording(self, key, entry, combo, custom_frame, mode_var, mapping_scope=None, prefix=None,
+                               value_writer=None, empty_writer=None, complete_callback=None):
         entry.config(state="normal")
         entry.delete(0, tk.END)
         entry.insert(0, "Recording...")
@@ -5166,18 +7019,67 @@ bg_color=panel_bg, widths=[8, 10])
         
         pressed_keys = set()
         recorded_seq = []
+        recording_cancelled = {"value": False}
+        recording_bind_ids = {}
+        restore_in_app_outside_click = {"value": False}
+        restore_joystick_outside_click = {"value": False}
         self.recording_controllers = True
         self.recorded_controller_buttons = set()
         self.waiting_for_controller_release = True
 
-        def end_recording():
+        in_app_bind_id = getattr(self, "in_app_gyro_popup_bind_id", None)
+        if in_app_bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", in_app_bind_id)
+            except tk.TclError:
+                pass
+            self.in_app_gyro_popup_bind_id = None
+            restore_in_app_outside_click["value"] = True
+
+        joystick_bind_id = getattr(self, "joystick_custom_popup_bind_id", None)
+        if joystick_bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", joystick_bind_id)
+            except tk.TclError:
+                pass
+            self.joystick_custom_popup_bind_id = None
+            restore_joystick_outside_click["value"] = True
+
+        def unbind_recording_events():
+            for sequence, bind_id in list(recording_bind_ids.items()):
+                try:
+                    self.root.unbind(sequence, bind_id)
+                except tk.TclError:
+                    pass
+            recording_bind_ids.clear()
+
+        def restore_popup_outside_clicks(delay_ms=100):
+            if restore_joystick_outside_click["value"] and getattr(self, "joystick_custom_popup", None) is not None:
+                self.root.after(delay_ms, self.bind_joystick_custom_popup_outside_click)
+            if restore_in_app_outside_click["value"] and getattr(self, "in_app_gyro_popup", None) is not None:
+                self.root.after(delay_ms, self.bind_in_app_gyro_popup_outside_click)
+
+        def cancel_recording_without_commit():
+            recording_cancelled["value"] = True
+            pressed_keys.clear()
+            recorded_seq.clear()
             self.recording_controllers = False
-            self.root.unbind("<KeyPress>")
-            self.root.unbind("<KeyRelease>")
-            self.root.unbind("<ButtonPress>")
-            self.root.unbind("<ButtonRelease>")
-            self.root.unbind("<MouseWheel>")
-            self.root.unbind("<FocusOut>")
+            self.recorded_controller_buttons = set()
+            self.waiting_for_controller_release = False
+            unbind_recording_events()
+            if getattr(self, "_cancel_custom_recording_without_commit", None) is cancel_recording_without_commit:
+                self._cancel_custom_recording_without_commit = None
+            restore_popup_outside_clicks(delay_ms=0)
+
+        self._cancel_custom_recording_without_commit = cancel_recording_without_commit
+
+        def end_recording():
+            if recording_cancelled["value"]:
+                return
+            self.recording_controllers = False
+            unbind_recording_events()
+            if getattr(self, "_cancel_custom_recording_without_commit", None) is cancel_recording_without_commit:
+                self._cancel_custom_recording_without_commit = None
             raw_seq = recorded_seq
             
             normalized_seq = []
@@ -5205,11 +7107,15 @@ bg_color=panel_bg, widths=[8, 10])
                     CONFIG.set_joystick_custom_scoped(base_key, current, mapping_scope)
             
             if not final_seq:
-                custom_frame.pack_forget()
-                combo.pack(side=tk.LEFT)
-                combo.set("Default")
-                CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
-                sync_joystick_direction("Default")
+                if empty_writer is not None:
+                    empty_writer()
+                else:
+                    custom_frame.pack_forget()
+                    combo.pack(side=tk.LEFT)
+                    combo.set("Default")
+                    CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
+                    self._joycon_ir_live_save(key, "Default")
+                    sync_joystick_direction("Default")
             else:
                 mode = mode_var.get()
                 val_content = "+".join(final_seq)
@@ -5217,16 +7123,22 @@ bg_color=panel_bg, widths=[8, 10])
                     val = f"Custom[{mode}]:{prefix}+{val_content}"
                 else:
                     val = f"Custom[{mode}]:{val_content}"
-                CONFIG.set_mapping_setting_scoped(key, val, mapping_scope)
-                sync_joystick_direction(val)
+                if value_writer is not None:
+                    value_writer(val)
+                else:
+                    CONFIG.set_mapping_setting_scoped(key, val, mapping_scope)
+                    self._joycon_ir_live_save(key, val)
+                    sync_joystick_direction(val)
                 entry.config(state="normal")
                 entry.delete(0, tk.END)
                 display_val = format_input_display(val_content)
                 entry.insert(0, display_val)
                 entry.config(state="readonly")
-            self.on_setting_changed()
-            if getattr(self, "joystick_custom_popup", None) is not None:
-                self.root.after(100, self.bind_joystick_custom_popup_outside_click)
+            if complete_callback is not None:
+                complete_callback(None if not final_seq else val)
+            else:
+                self.on_setting_changed()
+            restore_popup_outside_clicks(delay_ms=100)
 
         def check_release():
             if not pressed_keys and not getattr(self, 'controller_buttons_pressed', False):
@@ -5269,11 +7181,11 @@ bg_color=panel_bg, widths=[8, 10])
             self.root.after(100, check_release)
             return "break"
 
-        self.root.bind("<KeyPress>", on_key_press)
-        self.root.bind("<KeyRelease>", on_key_release)
-        self.root.bind("<ButtonPress>", on_mouse_press)
-        self.root.bind("<ButtonRelease>", on_mouse_release)
-        self.root.bind("<MouseWheel>", on_mouse_wheel)
+        recording_bind_ids["<KeyPress>"] = self.root.bind("<KeyPress>", on_key_press, add="+")
+        recording_bind_ids["<KeyRelease>"] = self.root.bind("<KeyRelease>", on_key_release, add="+")
+        recording_bind_ids["<ButtonPress>"] = self.root.bind("<ButtonPress>", on_mouse_press, add="+")
+        recording_bind_ids["<ButtonRelease>"] = self.root.bind("<ButtonRelease>", on_mouse_release, add="+")
+        recording_bind_ids["<MouseWheel>"] = self.root.bind("<MouseWheel>", on_mouse_wheel, add="+")
         
         def on_focus_out(e):
             if e.widget == self.root and getattr(self, 'recording_controllers', False):
@@ -5298,7 +7210,7 @@ bg_color=panel_bg, widths=[8, 10])
                             if f"VK_{chr(vk)}" not in recorded_seq:
                                 recorded_seq.append(f"VK_{chr(vk)}")
                 end_recording()
-        self.root.bind("<FocusOut>", on_focus_out)
+        recording_bind_ids["<FocusOut>"] = self.root.bind("<FocusOut>", on_focus_out, add="+")
         
 
         def poll_controller():
@@ -5336,6 +7248,7 @@ bg_color=panel_bg, widths=[8, 10])
     def create_mapping_widget(self, parent, key, label_text, mapping_scope=None, compact=False, fixed_size=None):
         suffix = self._mapping_scope_suffix(mapping_scope)
         attr_key = self._mapping_attr(key, suffix)
+        is_in_app_simul = key.endswith("_in_app_gyro_simul")
         parent_bg = parent.cget("bg") if hasattr(parent, "cget") else background_color
         if label_text:
             tk.Label(parent, text=label_text, bg=parent_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
@@ -5359,8 +7272,18 @@ bg_color=panel_bg, widths=[8, 10])
                 current = CONFIG.get_joystick_custom_scoped(base_key, mapping_scope)
                 current[direction] = value
                 CONFIG.set_joystick_custom_scoped(base_key, current, mapping_scope)
+
+        def set_mapping_value(value):
+            """Write a Mapping value and mirror Joy-Con IR bridge controls live."""
+            CONFIG.set_mapping_setting_scoped(key, value, mapping_scope)
+            self._joycon_ir_live_save(key, value)
         
-        combo = BackButtonSelector(container, self, font=scale_font(("Arial", 11, "bold")), auto_fit=fixed_size is None)
+        combo = BackButtonSelector(
+            container,
+            self,
+            font=scale_font(("Arial", 10 if fixed_size is not None else 11, "bold")),
+            auto_fit=fixed_size is None,
+        )
 
         custom_frame = tk.Frame(container, bg=parent_bg)
         
@@ -5374,7 +7297,7 @@ bg_color=panel_bg, widths=[8, 10])
             if mouse_click_mapping:
                 option_token, _mode = mouse_click_mapping
                 new_val = f"Custom[{new_mode}]:{MOUSE_CLICK_BACK_BUTTON_TOKENS[option_token]}"
-                CONFIG.set_mapping_setting_scoped(key, new_val, mapping_scope)
+                set_mapping_value(new_val)
                 sync_joystick_direction(new_val)
                 self.on_setting_changed()
             elif isinstance(current_val, str) and current_val.startswith("Custom"):
@@ -5382,14 +7305,14 @@ bg_color=panel_bg, widths=[8, 10])
                     new_val = f"Custom[{new_mode}]:{current_val.split(':', 1)[1]}"
                 else:
                     new_val = f"Custom[{new_mode}]:{current_val[7:]}"
-                CONFIG.set_mapping_setting_scoped(key, new_val, mapping_scope)
+                set_mapping_value(new_val)
                 sync_joystick_direction(new_val)
                 self.on_setting_changed()
 
         mode_btn = tk.Button(custom_frame, text="Hold", bg=button_gray, fg="white", font=scale_font(("Arial", 9, "bold")), bd=0, relief=tk.FLAT, command=toggle_mode, width=4)
         mode_btn.pack(side=tk.LEFT, padx=(0, int(2 * scaling_factor)), fill=tk.Y)
         
-        entry = RecordingEntry(custom_frame, normal_font=scale_font(("Arial", 11, "bold")), prefix_font=scale_font(("Arial", 8, "bold")), width=11, bg=button_gray, fg="white")
+        entry = RecordingEntry(custom_frame, normal_font=scale_font(("Arial", 11, "bold")), prefix_font=scale_font(("Arial", 8, "bold")), width=14 if is_in_app_simul else 11, bg=button_gray, fg="white")
         entry.pack(side=tk.LEFT, fill=tk.Y)
         # Hovering the (fixed-width, often clipped) recording shows its full content.
         Tooltip(entry, entry.get)
@@ -5406,6 +7329,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         mouse_click_btn._mouse_click_token = "Default"
         mouse_click_btn.get = lambda: getattr(mouse_click_btn, "_mouse_click_token", "Default")
+        mouse_click_btn.display_label = back_button_label
         mouse_click_btn.select_value = select_mouse_click_popup_value
         mouse_click_btn.config(command=lambda: self.open_back_button_popup(mouse_click_btn))
 
@@ -5415,6 +7339,55 @@ bg_color=panel_bg, widths=[8, 10])
             if reset_mode:
                 mode_var.set("Hold")
                 mode_btn.config(text="Hold")
+
+        def request_in_app_simul_reflow(force_base=False):
+            if not is_in_app_simul:
+                return
+            popup_for_reflow = getattr(self, "in_app_gyro_popup", None)
+            if popup_for_reflow is None:
+                return
+            if force_base:
+                reflow_now = getattr(popup_for_reflow, "in_app_reflow_simultaneous_input", None)
+                if callable(reflow_now):
+                    try:
+                        reflow_now(force_base=True)
+                        return
+                    except tk.TclError:
+                        pass
+            def do_reflow():
+                try:
+                    if popup_for_reflow.winfo_exists():
+                        popup_for_reflow.event_generate("<<InAppGyroSimulReflow>>")
+                except tk.TclError:
+                    pass
+            self.root.after_idle(do_reflow)
+
+        def reset_custom_mapping_widgets(reset_mouse=False):
+            if reset_mouse:
+                mouse_click_btn._mouse_click_token = "Default"
+            for widget in (mode_btn, entry, in_app_gyro_btn, mouse_click_btn, close_btn):
+                try:
+                    widget.pack_forget()
+                except tk.TclError:
+                    pass
+
+        def render_custom_mapping(include_close=True):
+            reset_custom_mapping_widgets(reset_mouse=True)
+            mode_btn.pack(side=tk.LEFT, padx=(0, int(2 * scaling_factor)), fill=tk.Y)
+            entry.pack(side=tk.LEFT, fill=tk.Y)
+            if include_close:
+                close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
+            custom_frame.pack(side=tk.LEFT)
+            request_in_app_simul_reflow()
+
+        def render_action_button_mapping(button, include_close=True, expand_button=False):
+            reset_custom_mapping_widgets(reset_mouse=(button is not mouse_click_btn))
+            mode_btn.pack(side=tk.LEFT, padx=(0, int(2 * scaling_factor)), fill=tk.Y)
+            button.pack(side=tk.LEFT, fill=tk.BOTH if expand_button else tk.Y, expand=expand_button)
+            if include_close:
+                close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
+            custom_frame.pack(side=tk.LEFT)
+            request_in_app_simul_reflow()
 
         def clear_in_app_gyro_settings():
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
@@ -5428,25 +7401,36 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_deadzone_effect_after_released_ms", 200, None)
 
         def on_close():
+            reset_value = "None" if is_in_app_simul else "Default"
+            cancel_recording = getattr(self, "_cancel_custom_recording_without_commit", None)
+            if callable(cancel_recording):
+                cancel_recording()
+            reset_custom_mapping_widgets(reset_mouse=True)
             custom_frame.pack_forget()
-            if in_app_gyro_btn:
-                in_app_gyro_btn.pack_forget()
-            clear_mouse_click_state(reset_mode=True)
-            if entry:
-                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
+            cp_frame.pack_forget()
+            mode_var.set("Hold")
+            mode_btn.config(text="Hold")
             pack_combo()
-            combo.set("Default")
-            CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
-            sync_joystick_direction("Default")
-            clear_in_app_gyro_settings()
+            combo.set(reset_value)
+            set_mapping_value(reset_value)
+            sync_joystick_direction(reset_value)
+            if reset_value == "Default":
+                clear_in_app_gyro_settings()
             self.on_setting_changed()
+            request_in_app_simul_reflow(force_base=True)
+            if is_in_app_simul and getattr(self, "in_app_gyro_popup", None) is not None:
+                self.root.after_idle(self.bind_in_app_gyro_popup_outside_click)
             if hasattr(self, 'focus_outline') and getattr(self.focus_outline, 'target_widget', None) == close_btn:
                 try:
                     self.focus_outline.update(combo)
                 except: pass
 
         close_btn = tk.Button(custom_frame, text="X", bg="#ff4444", fg="white", font=scale_font(("Arial", 10, "bold")), bd=0, relief=tk.FLAT, command=on_close)
-        close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
+        def cancel_recording_on_close_press(_event=None):
+            cancel_recording = getattr(self, "_cancel_custom_recording_without_commit", None)
+            if callable(cancel_recording):
+                cancel_recording()
+        close_btn.bind("<ButtonPress-1>", cancel_recording_on_close_press, add="+")
 
         def show_close_button():
             if not close_btn.winfo_ismapped():
@@ -5468,7 +7452,7 @@ bg_color=panel_bg, widths=[8, 10])
             clear_mouse_click_state(reset_mode=True)
             pack_combo()
             combo.set("Default")
-            CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
+            set_mapping_value("Default")
             sync_joystick_direction("Default")
             clear_in_app_gyro_settings()
             self.on_setting_changed()
@@ -5477,7 +7461,7 @@ bg_color=panel_bg, widths=[8, 10])
         cp_close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
 
         def show_change_profile(event=None):
-            CONFIG.set_mapping_setting_scoped(key, "Change Profile", mapping_scope)
+            set_mapping_value("Change Profile")
             sync_joystick_direction("Change Profile")
             combo.pack_forget()
             custom_frame.pack_forget()
@@ -5496,17 +7480,15 @@ bg_color=panel_bg, widths=[8, 10])
             value = f"Custom[{mode}]:{custom_token}"
             mouse_click_btn._mouse_click_token = option_token
             mouse_click_btn.config(text=back_button_label(option_token))
-            if in_app_gyro_btn:
-                in_app_gyro_btn.pack_forget()
-            if entry:
-                entry.pack_forget()
             combo.pack_forget()
-            hide_close_button()
-            mouse_click_btn.pack(side=tk.LEFT, fill=tk.Y)
-            custom_frame.pack(side=tk.LEFT)
+            render_action_button_mapping(
+                mouse_click_btn,
+                include_close=not is_in_app_simul,
+                expand_button=is_in_app_simul,
+            )
             combo.set(option_token)
             if write_config:
-                CONFIG.set_mapping_setting_scoped(key, value, mapping_scope)
+                set_mapping_value(value)
                 sync_joystick_direction(value)
                 self.on_setting_changed(event)
 
@@ -5522,16 +7504,13 @@ bg_color=panel_bg, widths=[8, 10])
                 option_token, mode = mouse_click_mapping
                 if current_val == option_token:
                     value = f"Custom[{mode}]:{MOUSE_CLICK_BACK_BUTTON_TOKENS[option_token]}"
-                    CONFIG.set_mapping_setting_scoped(key, value, mapping_scope)
+                    set_mapping_value(value)
                     sync_joystick_direction(value)
                 show_mouse_click_mapping(option_token, mode=mode, write_config=False)
                 return
             
             if isinstance(current_val, str) and current_val.startswith("Custom") and IN_APP_GYRO_TOKEN in current_val:
                 combo.pack_forget()
-                entry.pack_forget()
-                clear_mouse_click_state()
-                show_close_button()
                 
                 simul_val = CONFIG.get_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
                 display_str = IN_APP_GYRO_LABEL
@@ -5548,14 +7527,12 @@ bg_color=panel_bg, widths=[8, 10])
                         else: display_str += f" + {format_input_display(simul_val)}"
                 
                 in_app_gyro_btn.config(text=display_str)
-                in_app_gyro_btn.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
-                custom_frame.pack(side=tk.LEFT)
+                render_action_button_mapping(in_app_gyro_btn, include_close=True)
                 combo.set(IN_APP_GYRO_LABEL)
                 return
 
             if isinstance(current_val, str) and current_val.startswith("Custom"):
-                clear_mouse_click_state()
-                show_close_button()
+                render_custom_mapping(include_close=True)
                 entry.config(state="normal")
                 entry.delete(0, tk.END)
 
@@ -5583,7 +7560,6 @@ bg_color=panel_bg, widths=[8, 10])
                     entry.insert(0, display_val)
                     combo.set("Custom")
                 entry.config(state="readonly")
-                custom_frame.pack(side=tk.LEFT)
             elif current_val == "Change Profile":
                 combo.set("Change Profile")
                 custom_frame.pack_forget()
@@ -5598,32 +7574,61 @@ bg_color=panel_bg, widths=[8, 10])
         show_current()
 
         def show_token_mapping(token, label, event=None):
-            mode = mode_var.get() if mode_var.get() in ("Hold", "Tap") else "Hold"
+            try:
+                mode = mode_var.get() if mode_var.get() in ("Hold", "Tap") else "Hold"
+            except tk.TclError:
+                return
             mode_var.set(mode)
             mode_btn.config(text=mode)
-            CONFIG.set_mapping_setting_scoped(key, f"Custom[{mode}]:{token}", mapping_scope)
+            set_mapping_value(f"Custom[{mode}]:{token}")
             sync_joystick_direction(f"Custom[{mode}]:{token}")
             if in_app_gyro_btn:
                 in_app_gyro_btn.pack_forget()
-            clear_mouse_click_state()
-            show_close_button()
-            if entry:
-                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
+            render_custom_mapping(include_close=True)
             entry.config(state="normal")
             entry.delete(0, tk.END)
             entry.insert(0, label)
             entry.config(state="readonly")
             combo.pack_forget()
-            custom_frame.pack(side=tk.LEFT)
             self.on_setting_changed(event)
 
         def show_in_app_gyro_popup(event=None):
+            # A click can be queued while its owning Mapping popup is being rebuilt.
+            # Never let a stale command closure configure widgets that Tk has already
+            # destroyed; the newly-created control owns subsequent interactions.
+            try:
+                if not in_app_gyro_btn.winfo_exists() or not mode_btn.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            # A Simultaneous Input button is a descendant of the In-app Gyro popup
+            # which owns it.  Replacing that owner would destroy mode_btn midway
+            # through this callback; leave the owner alive instead of recursing.
+            existing_popup = getattr(self, "in_app_gyro_popup", None)
+            if existing_popup is not None and existing_popup.winfo_exists():
+                try:
+                    ancestor = in_app_gyro_btn
+                    while ancestor is not None:
+                        if ancestor is existing_popup:
+                            return
+                        parent_name = ancestor.winfo_parent()
+                        if not parent_name:
+                            break
+                        ancestor = ancestor.nametowidget(parent_name)
+                except (tk.TclError, KeyError):
+                    return
             if self._toggle_in_app_gyro_popup(in_app_gyro_btn): return
-            self.close_in_app_gyro_popup()
+            if existing_popup is not None and existing_popup.winfo_exists():
+                self.close_in_app_gyro_popup()
             
             mode = mode_var.get() if mode_var.get() in ("Hold", "Tap") else "Hold"
             mode_var.set(mode)
-            mode_btn.config(text=mode)
+            try:
+                if not mode_btn.winfo_exists():
+                    return
+                mode_btn.config(text=mode)
+            except tk.TclError:
+                return
             
             spacing = int(10 * scaling_factor)
             row_gap = int(8 * scaling_factor)
@@ -5638,6 +7643,8 @@ bg_color=panel_bg, widths=[8, 10])
             popup_control_font = scale_font(("Arial", 10, "bold"))
             popup_control_measure = tkFont.Font(font=popup_control_font)
             popup_control_width = popup_control_measure.measure("0" * 14) + int(18 * scaling_factor)
+            base_popup_control_width = popup_control_width
+            simul_control_width = base_popup_control_width
             popup_control_height = popup_control_measure.metrics("linespace") + int(10 * scaling_factor)
             placement_state = {"anchor_coords": None, "full_size": None, "ready": False}
             popup_rows = []
@@ -5695,7 +7702,7 @@ bg_color=panel_bg, widths=[8, 10])
                 meta = popup_row_meta[row]
                 pady = (meta["pady_top"], 0)
                 meta["label"].grid(row=meta["row_index"], column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=pady)
-                meta["control_cell"].grid(row=meta["row_index"], column=1, sticky=tk.E, pady=pady)
+                meta["control_cell"].grid(row=meta["row_index"], column=1, sticky=tk.W, pady=pady)
                 meta["visible"] = True
 
             def hide_popup_row(row):
@@ -5715,19 +7722,34 @@ bg_color=panel_bg, widths=[8, 10])
                 content_width = label_col_width + int(5 * scaling_factor) + popup_control_width
                 for meta in popup_rows:
                     meta["label"].config(width=0)
-                    meta["control_cell"].config(width=popup_control_width, height=popup_control_height)
+                    cell_width = simul_control_width if meta["control_cell"] is simul_cell else base_popup_control_width
+                    meta["control_cell"].config(width=cell_width, height=popup_control_height)
                 for meta in popup_separators:
                     meta["line"].config(width=content_width, height=1)
                 popup.update_idletasks()
 
+            def estimate_full_requested_size():
+                popup.update_idletasks()
+                label_col_width = max((meta["label"].winfo_reqwidth() for meta in popup_rows), default=0)
+                width = label_col_width + int(5 * scaling_factor) + popup_control_width + popup_padding * 2 + 2
+                height = popup_padding * 2 + 2
+                for meta in popup_rows:
+                    height += meta["pady_top"] + max(meta["label"].winfo_reqheight(), popup_control_height)
+                for meta in popup_separators:
+                    height += meta["pady_top"] + 1
+                return (max(1, width), max(1, height))
+
             def _place_in_app_gyro_popup():
                 if not placement_state["ready"]:
                     return
+                # sync_in_app_popup_layout() ends with update_idletasks and
+                # _place_popup_within_root_bounds does its own, so an extra pass here is
+                # redundant reflow on every row show/hide.
                 sync_in_app_popup_layout()
-                popup.update_idletasks()
+                anchor = getattr(popup, "in_app_visible_anchor", in_app_gyro_btn)
                 self._place_popup_within_root_bounds(
                     popup,
-                    in_app_gyro_btn,
+                    anchor,
                     fallback_coords=placement_state["anchor_coords"],
                     requested_size=placement_state["full_size"],
                 )
@@ -5744,7 +7766,7 @@ bg_color=panel_bg, widths=[8, 10])
 
             _row, simul_cell = create_aligned_popup_row("Simultaneous Input:", pady_top=0)
             simul_inner = tk.Frame(simul_cell, bg=background_color)
-            simul_inner.pack(side=tk.RIGHT)
+            simul_inner.pack(side=tk.LEFT)
             
             simul_key = f"{key}_in_app_gyro_simul"
             self.create_mapping_widget(
@@ -5758,6 +7780,7 @@ bg_color=panel_bg, widths=[8, 10])
             
             suffix = self._mapping_scope_suffix(None)
             simul_combo = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_combo", None)
+            simul_container = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_container", None)
             simul_entry = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_entry", None)
             simul_custom_frame = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_custom_frame", None)
             simul_mode_btn = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_mode_btn", None)
@@ -5788,12 +7811,71 @@ bg_color=panel_bg, widths=[8, 10])
                 simul_entry.insert(0, format_input_display(display_val))
                 simul_entry.config(state="readonly")
 
+            def reflow_simultaneous_input(*_args, force_base=False):
+                """Let the compound Mapping control widen the In-app Gyro popup.
+
+                A fixed standard control column is sufficient for a selector, but not
+                for Hold/Tap + a full action label + X.  The requested width grows to
+                the actual compound control width; placement then preferentially
+                extends right from the anchor and clamps only at the root boundary.
+                """
+                nonlocal popup_control_width, simul_control_width
+                try:
+                    popup.update_idletasks()
+                    current_value = CONFIG.get_mapping_setting_scoped(simul_key, "None", None)
+                    required = base_popup_control_width
+                    if (not force_base
+                            and simul_custom_frame is not None
+                            and isinstance(current_value, str)
+                            and current_value.startswith("Custom")):
+                        required = max(required, simul_custom_frame.winfo_reqwidth() + int(2 * scaling_factor))
+                except Exception:
+                    return
+                if required == simul_control_width:
+                    return
+                simul_control_width = required
+                popup_control_width = max(base_popup_control_width, simul_control_width)
+                simul_cell.config(width=simul_control_width, height=popup_control_height)
+                simul_inner.config(width=simul_control_width, height=popup_control_height)
+                if simul_container is not None:
+                    simul_container.config(width=simul_control_width, height=popup_control_height)
+                if simul_custom_frame is not None:
+                    simul_custom_frame.update_idletasks()
+                placement_state["full_size"] = estimate_full_requested_size()
+                popup.in_app_full_requested_size = placement_state["full_size"]
+                sync_in_app_popup_layout()
+                popup.update_idletasks()
+                anchor = getattr(popup, "in_app_visible_anchor", in_app_gyro_btn)
+                self._place_popup_within_root_bounds(
+                    popup,
+                    anchor,
+                    fallback_coords=placement_state["anchor_coords"],
+                    requested_size=placement_state["full_size"],
+                )
+
+            popup.in_app_reflow_simultaneous_input = reflow_simultaneous_input
+
+            def schedule_simultaneous_reflow(*_args):
+                self.root.after_idle(reflow_simultaneous_input)
+
+            if simul_combo is not None:
+                simul_combo.bind("<<ComboboxSelected>>", schedule_simultaneous_reflow, add="+")
+            if simul_custom_frame is not None:
+                simul_custom_frame.bind("<Configure>", schedule_simultaneous_reflow, add="+")
+                simul_custom_frame.bind("<ButtonRelease-1>", schedule_simultaneous_reflow, add="+")
+            for widget in (simul_inner, simul_container, simul_entry, simul_mode_btn):
+                if widget is not None:
+                    widget.bind("<ButtonRelease-1>", schedule_simultaneous_reflow, add="+")
+                    widget.bind("<KeyRelease>", schedule_simultaneous_reflow, add="+")
+            popup.bind("<<InAppGyroSimulReflow>>", schedule_simultaneous_reflow, add="+")
+            self.root.after_idle(reflow_simultaneous_input)
+
             create_popup_separator()
             dz_row, dz_control_cell = create_aligned_popup_row("Trigger Deadzone:", pady_top=section_gap / scaling_factor)
 
             dz_mode_key = f"{key}_in_app_gyro_deadzone_mode"
             dz_button_group = tk.Frame(dz_control_cell, bg=background_color, width=popup_control_width, height=popup_control_height)
-            dz_button_group.pack(side=tk.RIGHT)
+            dz_button_group.pack(side=tk.LEFT)
             dz_button_group.pack_propagate(False)
             dz_button = tk.Button(
                 dz_button_group,
@@ -5804,7 +7886,7 @@ bg_color=panel_bg, widths=[8, 10])
                 relief=tk.FLAT,
                 width=14,
             )
-            dz_button.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+            dz_button.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
             def create_numeric_setting_row(label_text, setting_key, default_value, min_value=0.0, max_value=None, integer=False, suffix_text=""):
                 row, control_cell = create_aligned_popup_row(label_text, pady_top=row_gap / scaling_factor, pack_now=False)
@@ -5820,7 +7902,7 @@ bg_color=panel_bg, widths=[8, 10])
                     initial_text = str(initial_value)
                 var = tk.StringVar(value=initial_text)
                 input_group = tk.Frame(control_cell, bg=background_color, width=popup_control_width, height=popup_control_height)
-                input_group.pack(side=tk.RIGHT)
+                input_group.pack(side=tk.LEFT)
                 input_group.pack_propagate(False)
                 entry_widget = tk.Entry(
                     input_group,
@@ -5833,38 +7915,71 @@ bg_color=panel_bg, widths=[8, 10])
                     font=popup_control_font,
                     justify=tk.CENTER,
                 )
+                # Metadata for gamepad numeric adjust (_nav_adjust_numeric_entry) so it steps
+                # and clamps precisely; commit still flows through the textvariable trace.
+                entry_widget.num_min = min_value
+                entry_widget.num_max = max_value
+                entry_widget.num_integer = integer
                 if suffix_text:
                     suffix_label = tk.Label(input_group, text=suffix_text, bg=background_color, fg=text_color, font=popup_control_font)
                     suffix_label.pack(side=tk.RIGHT, fill=tk.Y, padx=(int(4 * scaling_factor), 0))
-                    entry_widget.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+                    entry_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
                 else:
-                    entry_widget.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+                    entry_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-                def commit_value(event=None, normalize_text=True):
+                def commit_value(event=None, normalize_text=True, save=True):
+                    # Re-entrancy guard: the var.set(...) normalization below re-fires the
+                    # write-trace commit_on_change, which would save again (save defaults
+                    # True) -- that cascade was the residual save when the popup closes
+                    # (commit_numeric_settings / FocusOut both trigger it). Suppress the
+                    # trace-driven commit while we are inside commit_value.
+                    if getattr(self, "_in_app_numeric_committing", False):
+                        return
+                    # An empty / non-numeric var is a transient state (widget teardown, a
+                    # <FocusOut> during re-navigation, or mid-edit). Keep the last committed
+                    # value instead of collapsing to default_value -- that fallback was the
+                    # only source of the "jumps to default" on gamepad re-adjust after reopen.
                     try:
-                        value = float(var.get())
+                        raw = (var.get() or "").strip()
                     except Exception:
-                        value = float(default_value)
-                    value = max(float(min_value), value)
-                    if max_value is not None:
-                        value = min(float(max_value), value)
-                    stored = int(round(value)) if integer else float(value)
-                    CONFIG.set_mapping_setting_scoped(setting_key, stored, None)
-                    CONFIG.save_config()
-                    if normalize_text:
-                        if isinstance(stored, float) and stored.is_integer():
-                            var.set(str(int(stored)))
-                        else:
-                            var.set(str(stored))
+                        raw = ""
+                    if raw == "":
+                        return
+                    try:
+                        value = float(raw)
+                    except (TypeError, ValueError):
+                        return
+                    self._in_app_numeric_committing = True
+                    try:
+                        value = max(float(min_value), value)
+                        if max_value is not None:
+                            value = min(float(max_value), value)
+                        stored = int(round(value)) if integer else float(value)
+                        CONFIG.set_mapping_setting_scoped(setting_key, stored, None)
+                        self._joycon_ir_live_save(setting_key, stored)
+                        if save:
+                            CONFIG.save_config()
+                        if normalize_text:
+                            if isinstance(stored, float) and stored.is_integer():
+                                var.set(str(int(stored)))
+                            else:
+                                var.set(str(stored))
+                    finally:
+                        self._in_app_numeric_committing = False
 
                 def commit_on_change(*_args):
+                    if getattr(self, "_in_app_numeric_committing", False):
+                        return
                     try:
                         float(var.get())
                     except Exception:
                         return
                     commit_value(normalize_text=False)
 
-                entry_widget.bind("<FocusOut>", commit_value)
+                # FocusOut fires when the popup is closed (focus leaves the entry); the value
+                # is already persisted live by commit_on_change per keystroke, so don't save
+                # again here -- that was the residual save on window close.
+                entry_widget.bind("<FocusOut>", lambda e: commit_value(e, save=False))
                 entry_widget.bind("<Return>", commit_value)
                 var.trace_add("write", commit_on_change)
                 numeric_committers.append(commit_value)
@@ -5874,9 +7989,13 @@ bg_color=panel_bg, widths=[8, 10])
                 if numeric_commit_state["done"]:
                     return
                 numeric_commit_state["done"] = True
+                # Runs only on close: a final (harmless) commit of each numeric value with
+                # NO save -- every edit already persisted live per keystroke / FocusOut (and
+                # live-saved into the IR store via _joycon_ir_live_save), so closing does no
+                # extra save.
                 for commit in numeric_committers:
                     try:
-                        commit()
+                        commit(save=False)
                     except Exception:
                         pass
 
@@ -5965,6 +8084,7 @@ bg_color=panel_bg, widths=[8, 10])
                         selected.add(token)
                     ordered = [token for token in SWITCH_INPUT_DAMPENING_OPTIONS if token in selected]
                     CONFIG.set_mapping_setting_scoped(dz_mode_key, ordered, None)
+                    self._joycon_ir_live_save(dz_mode_key, ordered)
                     CONFIG.save_config()
                     set_button_state(token)
                     refresh_dz_button()
@@ -5998,7 +8118,7 @@ bg_color=panel_bg, widths=[8, 10])
             damp_mode_key = f"{key}_in_app_gyro_dampening_mode"
             damp_button_width = 14
             damp_button_group = tk.Frame(damp_control_cell, bg=background_color, width=popup_control_width, height=popup_control_height)
-            damp_button_group.pack(side=tk.RIGHT)
+            damp_button_group.pack(side=tk.LEFT)
             damp_button_group.pack_propagate(False)
             damp_button = tk.Button(
                 damp_button_group,
@@ -6009,7 +8129,7 @@ bg_color=panel_bg, widths=[8, 10])
                 relief=tk.FLAT,
                 width=damp_button_width,
             )
-            damp_button.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+            damp_button.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
             damp_amt_row, damp_amt_control_cell = create_aligned_popup_row("Dampening Amount %:", pady_top=row_gap / scaling_factor, pack_now=False)
             
@@ -6018,11 +8138,12 @@ bg_color=panel_bg, widths=[8, 10])
             
             def on_damp_amt_change(val):
                 CONFIG.set_mapping_setting_scoped(damp_amt_key, int(float(val)), None)
+                self._joycon_ir_live_save(damp_amt_key, int(float(val)))
                 CONFIG.save_config()
                 
             damp_scale = tk.Scale(damp_amt_control_cell, from_=0, to=100, resolution=1, orient=tk.HORIZONTAL, length=popup_control_width, bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=popup_control_font, command=on_damp_amt_change)
             damp_scale.set(damp_amt_val)
-            damp_scale.pack(side=tk.RIGHT)
+            damp_scale.pack(side=tk.LEFT)
 
             damp_effect_released_key = f"{key}_in_app_gyro_dampening_effect_after_released_ms"
             damp_effect_released_row, _commit_damp_effect_released = create_numeric_setting_row(
@@ -6103,6 +8224,7 @@ bg_color=panel_bg, widths=[8, 10])
                         selected.add(token)
                     ordered = [token for token in SWITCH_INPUT_DAMPENING_OPTIONS if token in selected]
                     CONFIG.set_mapping_setting_scoped(damp_mode_key, ordered, None)
+                    self._joycon_ir_live_save(damp_mode_key, ordered)
                     CONFIG.save_config()
                     set_button_state(token)
                     refresh_damp_button()
@@ -6167,18 +8289,13 @@ bg_color=panel_bg, widths=[8, 10])
                 anchor_coords = (ax, ay, aw, ah)
             except Exception:
                 anchor_coords = None
-                
-            for setting_row in dz_setting_rows:
-                show_popup_row(setting_row)
-            for setting_row in damp_setting_rows:
-                show_popup_row(setting_row)
-            sync_in_app_popup_layout(force_all=True)
-            popup.update_idletasks()
-            placement_state["anchor_coords"] = anchor_coords
-            placement_state["full_size"] = (popup.winfo_reqwidth(), popup.winfo_reqheight())
 
-            # Measure the full expansion size before the popup is placed, then collapse to
-            # the actual current state before the first visible placement to avoid flicker.
+            placement_state["anchor_coords"] = anchor_coords
+            placement_state["full_size"] = estimate_full_requested_size()
+            popup.in_app_full_requested_size = placement_state["full_size"]
+
+            # The live popup is never expanded just to measure placement; otherwise Tk can
+            # paint the hidden rows for one frame before they are collapsed.
             refresh_dz_button()
             refresh_damp_button()
             sync_in_app_popup_layout()
@@ -6202,12 +8319,19 @@ bg_color=panel_bg, widths=[8, 10])
                 
             if selected == "Custom":
                 combo.pack_forget()
-                in_app_gyro_btn.pack_forget()
-                clear_mouse_click_state()
-                show_close_button()
-                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
-                custom_frame.pack(side=tk.LEFT)
-                self.start_custom_recording(key, entry, combo, custom_frame, mode_var, mapping_scope)
+                render_custom_mapping(include_close=True)
+                if is_in_app_simul and getattr(self, "in_app_gyro_popup", None) is not None:
+                    set_mapping_value("Custom")
+                    entry.config(state="normal")
+                    entry.delete(0, tk.END)
+                    entry.insert(0, "Recording...")
+                    entry.config(state="readonly")
+                    def start_after_reflow():
+                        request_in_app_simul_reflow()
+                        self.root.after_idle(lambda: self.start_custom_recording(key, entry, combo, custom_frame, mode_var, mapping_scope))
+                    self.root.after_idle(start_after_reflow)
+                else:
+                    self.start_custom_recording(key, entry, combo, custom_frame, mode_var, mapping_scope)
             elif selected == GYRO_LOCK_LABEL:
                 show_token_mapping(GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, event)
             elif selected == MODE_SHIFT_LABEL:
@@ -6216,17 +8340,13 @@ bg_color=panel_bg, widths=[8, 10])
                 mode = mode_var.get() if mode_var.get() in ("Hold", "Tap") else "Hold"
                 mode_var.set(mode)
                 mode_btn.config(text=mode)
-                CONFIG.set_mapping_setting_scoped(key, f"Custom[{mode}]:{IN_APP_GYRO_TOKEN}", mapping_scope)
+                set_mapping_value(f"Custom[{mode}]:{IN_APP_GYRO_TOKEN}")
                 sync_joystick_direction(f"Custom[{mode}]:{IN_APP_GYRO_TOKEN}")
                 self.on_setting_changed(event)
                 
-                combo.pack_forget()
-                entry.pack_forget()
-                clear_mouse_click_state()
-                show_close_button()
                 in_app_gyro_btn.config(text=IN_APP_GYRO_LABEL)
-                in_app_gyro_btn.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
-                custom_frame.pack(side=tk.LEFT)
+                combo.pack_forget()
+                render_action_button_mapping(in_app_gyro_btn, include_close=True)
                 show_in_app_gyro_popup(event)
             elif selected == "Change Profile":
                 show_change_profile(event)
@@ -6238,7 +8358,7 @@ bg_color=panel_bg, widths=[8, 10])
                 clear_mouse_click_state(reset_mode=True)
                 combo.set(selected)
                 pack_combo()
-                CONFIG.set_mapping_setting_scoped(key, selected, mapping_scope)
+                set_mapping_value(selected)
                 sync_joystick_direction(selected)
                 self.on_setting_changed(event)
 
@@ -6247,6 +8367,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         combo.bind("<<ComboboxSelected>>", on_combo_selected)
         setattr(self, f"{attr_key}_combo", combo)
+        setattr(self, f"{attr_key}_container", container)
         setattr(self, f"{attr_key}_custom_frame", custom_frame)
         setattr(self, f"{attr_key}_entry", entry)
         setattr(self, f"{attr_key}_in_app_gyro_btn", in_app_gyro_btn)
@@ -6366,11 +8487,24 @@ bg_color=panel_bg, widths=[8, 10])
         return False
 
     def close_joystick_custom_popup(self):
+        self.close_joycon_ir_mouse_popup()
+        self._close_joycon_ir_switch_input_popup()
+        ir_change_popup = getattr(self, "joycon_ir_change_profile_popup", None)
+        if ir_change_popup is not None and ir_change_popup.winfo_exists():
+            ir_change_popup.destroy()
+        self.joycon_ir_change_profile_popup = None
+        commit_deadzone = getattr(self, "joystick_deadzone_popup_commit", None)
+        if callable(commit_deadzone):
+            try:
+                commit_deadzone()
+            except Exception:
+                pass
         popup = getattr(self, "joystick_custom_popup", None)
         if popup is not None and popup.winfo_exists():
             popup.destroy()
         self.joystick_custom_popup = None
         self.joystick_custom_popup_anchor = None
+        self.joystick_deadzone_popup_commit = None
         bind_id = getattr(self, "joystick_custom_popup_bind_id", None)
         if bind_id:
             try:
@@ -6402,12 +8536,208 @@ bg_color=panel_bg, widths=[8, 10])
             # on the root, so clicks inside it must not be treated as "outside".
             if self._event_in_widget(getattr(self, "back_button_popup", None), event):
                 return
+            if self._event_in_widget(getattr(self, "joycon_ir_mouse_popup", None), event):
+                return
+            if self._event_in_widget(getattr(self, "joycon_ir_switch_input_popup", None), event):
+                return
+            if self._event_in_widget(getattr(self, "joycon_ir_change_profile_popup", None), event):
+                return
+            if self._event_in_widget(getattr(self, "in_app_gyro_popup", None), event):
+                return
+            if self._event_in_widget(getattr(self, "deadzone_input_popup", None), event):
+                return
+            if self._event_in_widget(getattr(self, "dampening_input_popup", None), event):
+                return
+            if self._event_in_widget(getattr(self, "joycon_ir_in_app_gyro_bridge", None), event):
+                return
+            if self._event_in_widget(getattr(self, "joycon_ir_in_app_gyro_anchor", None), event):
+                return
             # Leave clicks on the owning anchor to its command (toggles the popup closed).
             if self._event_in_widget(getattr(self, "joystick_custom_popup_anchor", None), event):
                 return
             self.close_joystick_custom_popup()
 
         self.joystick_custom_popup_bind_id = self.root.bind("<ButtonPress>", close_if_outside, add="+")
+
+    # Gamepad numeric-entry hold-to-repeat acceleration (all easily tunable here).
+    NUM_REPEAT_BASE_HZ = 5.0          # initial steps/sec while held (pre-accel speed = 0.2s)
+    NUM_REPEAT_ACCEL_DELAY = 3.0      # seconds held before acceleration starts
+    NUM_REPEAT_ACCEL_INTERVAL = 0.5   # seconds between each speed-up (reaches max ~6.5s in)
+    NUM_REPEAT_ACCEL_FACTOR = 1.2     # frequency multiplier per interval
+    NUM_REPEAT_MAX_HZ = 20.0          # max steps/sec cap (poll limit ~20/sec)
+    NUM_REPEAT_RELEASE_GAP = 0.15     # no-input gap (s) that counts as release -> reset
+
+    def _is_numeric_entry(self, w):
+        if not isinstance(w, tk.Entry):
+            return False
+        try:
+            t = (w.get() or "").strip()
+            if t == "":
+                return True
+            float(t)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    def _nav_numeric_hold_should_step(self, entry, up, now):
+        """Return True if the held numeric direction should fire a step this tick, using an
+        accelerating repeat: BASE_HZ until ACCEL_DELAY, then x ACCEL_FACTOR every
+        ACCEL_INTERVAL, capped at MAX_HZ. A gap > RELEASE_GAP restarts the ramp."""
+        token = (id(entry), bool(up))
+        prev = getattr(self, "_num_hold", None)  # (token, start, seen, next_fire)
+        if prev is None or prev[0] != token or (now - prev[2]) > self.NUM_REPEAT_RELEASE_GAP:
+            self._num_hold = (token, now, now, now + 1.0 / max(0.001, self.NUM_REPEAT_BASE_HZ))
+            return True  # new hold -> immediate first step
+        _tok, start, _seen, next_fire = prev
+        if now >= next_fire:
+            elapsed = now - start
+            rate = self.NUM_REPEAT_BASE_HZ
+            if elapsed >= self.NUM_REPEAT_ACCEL_DELAY:
+                n = int((elapsed - self.NUM_REPEAT_ACCEL_DELAY) // self.NUM_REPEAT_ACCEL_INTERVAL) + 1
+                rate = min(self.NUM_REPEAT_MAX_HZ, self.NUM_REPEAT_BASE_HZ * (self.NUM_REPEAT_ACCEL_FACTOR ** n))
+            interval = 1.0 / max(0.001, rate)
+            # Accumulate the phase (don't reset to now) so the average rate matches the
+            # target even though poll ticks are quantized to 50ms; otherwise sub-poll
+            # interval changes get rounded back up to the base rate (no perceived accel).
+            nf = next_fire + interval
+            if nf < now:  # fell behind (e.g. a poll stall) -> resync, avoid a burst
+                nf = now + interval
+            self._num_hold = (token, start, now, nf)
+            return True
+        self._num_hold = (token, start, now, next_fire)  # update "seen" so release is detected
+        return False
+
+    def _nav_adjust_numeric_entry(self, entry, up):
+        """Gamepad numeric adjust for ANY text Entry holding a number. Steps the value and
+        fires the entry's own commit bindings (Return/KeyRelease/textvariable-trace) so it
+        clamps / re-displays / saves exactly like typing. Returns True if it adjusted a
+        numeric entry, False otherwise (so callers can fall back to spatial navigation).
+
+        Optional per-entry tuning via widget attributes (defaults suit every current entry):
+        num_step (default 1), num_min (default 0), num_max (default None), num_integer."""
+        if not isinstance(entry, tk.Entry):
+            return False
+        try:
+            txt = (entry.get() or "").strip()
+        except Exception:
+            return False
+        try:
+            cur = float(txt) if txt else 0.0
+        except (TypeError, ValueError):
+            return False  # free-text entry -> not adjustable
+        step = float(getattr(entry, "num_step", 1) or 1)
+        new = cur + (step if up else -step)
+        nmin = getattr(entry, "num_min", 0)
+        nmax = getattr(entry, "num_max", None)
+        if nmin is not None:
+            new = max(float(nmin), new)
+        if nmax is not None:
+            new = min(float(nmax), new)
+        integer = getattr(entry, "num_integer", None)
+        if integer is None:
+            integer = float(step).is_integer() and ("." not in txt)
+        text = str(int(round(new))) if integer else ("%g" % new)
+        try:
+            varname = entry.cget("textvariable")
+        except Exception:
+            varname = ""
+        if varname:
+            try:
+                entry.setvar(varname, text)  # single write -> textvariable trace commits
+            except Exception:
+                varname = ""
+        if not varname:
+            try:
+                entry.delete(0, tk.END)
+                entry.insert(0, text)
+            except Exception:
+                return False
+        # Fire the entry's own commit bindings (clamp / normalize display / save). Whichever
+        # is bound runs; the other is a harmless no-op.
+        for seq in ("<KeyRelease>", "<Return>"):
+            try:
+                entry.event_generate(seq)
+            except Exception:
+                pass
+        return True
+
+    def _nav_top_dialog(self):
+        """Return the top-most open modal dialog Toplevel (found via the Tk grab), or None.
+        Only grabbed dialogs qualify, so non-modal transients/tooltips are ignored. These
+        are custom Toplevels (custom_messagebox / show_centered_dialog) with navigable
+        tk.Buttons; the gamepad nav targets them so dialogs like reset-confirm are usable."""
+        try:
+            g = self.root.grab_current()
+        except Exception:
+            g = None
+        w = g
+        while isinstance(w, tk.Widget) and not isinstance(w, tk.Toplevel):
+            try:
+                p = w.winfo_parent()
+                w = self.root.nametowidget(p) if p else None
+            except Exception:
+                w = None
+        if isinstance(w, tk.Toplevel) and w is not self.root:
+            try:
+                if w.winfo_exists() and w.winfo_ismapped():
+                    return w
+            except Exception:
+                return None
+        return None
+
+    def _nav_top_popup(self):
+        """Return (attr, frame, anchor) of the top-most open floating window (popup), or
+        (None, None, None) if none is open. Popups are root-child tk.Frames stored in
+        self.<name>_popup with the opener in self.<name>_popup_anchor. The top-most is the
+        inner-most: a popup whose anchor lives inside another open popup's frame."""
+        open_popups = []  # (attr, frame, anchor)
+        for attr, w in list(vars(self).items()):
+            if not attr.endswith("_popup") or not isinstance(w, tk.Widget):
+                continue
+            try:
+                if not w.winfo_exists():
+                    continue
+            except Exception:
+                continue
+            open_popups.append((attr, w, getattr(self, f"{attr}_anchor", None)))
+        if not open_popups:
+            return (None, None, None)
+        frames = {w for _, w, _ in open_popups}
+        def anchor_inside_other(anchor, own):
+            w, seen = anchor, 0
+            while isinstance(w, tk.Widget) and w is not self.root and seen < 60:
+                if w in frames and w is not own:
+                    return True
+                p = w.winfo_parent()
+                w = self.root.nametowidget(p) if p else None
+                seen += 1
+            return False
+        target = next((t for t in open_popups if t[2] is not None and anchor_inside_other(t[2], t[1])), None)
+        return target or open_popups[0]
+
+    def _nav_close_top_popup(self):
+        """Gamepad UI-nav helper: close the top-most open floating window (popup) and
+        re-highlight the button that opened it, staying in UI-control mode. Returns True
+        if a popup was closed, else False (so the caller exits control mode instead)."""
+        attr, frame, anchor = self._nav_top_popup()
+        if frame is None:
+            return False
+        close_fn = getattr(self, f"close_{attr}", None)
+        if callable(close_fn):
+            try: close_fn()
+            except Exception: pass
+        else:
+            try: frame.destroy()
+            except Exception: pass
+            setattr(self, attr, None)
+        if isinstance(anchor, tk.Widget):
+            try:
+                if anchor.winfo_exists():
+                    self.root.focus_set()
+                    self.focus_outline.update(anchor)
+            except Exception:
+                pass
+        return True
 
     def _toggle_in_app_gyro_popup(self, anchor_widget):
         existing = getattr(self, "in_app_gyro_popup", None)
@@ -6423,6 +8753,21 @@ bg_color=panel_bg, widths=[8, 10])
                 commit_numeric()
             except Exception:
                 pass
+        # Every control persists at change time. Closing must not perform another
+        # bulk transfer or disk save; it only finalizes no-save numeric state.
+        self._joycon_ir_in_app_live_ctx = None
+        # Hide every placed frame FIRST so they all vanish in a single repaint. These are
+        # embedded root-child frames (not Toplevels); destroying them one-by-one repaints
+        # the exposed root background in grid-cell strips -> the "bar-like segmented" close.
+        # place_forget unmaps them atomically; the subsequent destroy() is then invisible.
+        for _attr in ("deadzone_input_popup", "dampening_input_popup",
+                      "in_app_gyro_popup", "joycon_ir_in_app_gyro_bridge"):
+            _frame = getattr(self, _attr, None)
+            if _frame is not None and _frame.winfo_exists():
+                try:
+                    _frame.place_forget()
+                except Exception:
+                    pass
         dz_popup = getattr(self, "deadzone_input_popup", None)
         if dz_popup is not None and dz_popup.winfo_exists():
             dz_popup.destroy()
@@ -6439,6 +8784,11 @@ bg_color=panel_bg, widths=[8, 10])
         self.in_app_gyro_popup = None
         self.in_app_gyro_popup_anchor = None
         self.in_app_gyro_popup_commit_numeric = None
+        bridge = getattr(self, "joycon_ir_in_app_gyro_bridge", None)
+        if bridge is not None and bridge.winfo_exists():
+            bridge.destroy()
+        self.joycon_ir_in_app_gyro_bridge = None
+        self.joycon_ir_in_app_gyro_anchor = None
         bind_id = getattr(self, "in_app_gyro_popup_bind_id", None)
         if bind_id:
             try:
@@ -6497,6 +8847,109 @@ bg_color=panel_bg, widths=[8, 10])
             self.close_in_app_gyro_popup()
 
         self.in_app_gyro_popup_bind_id = self.root.bind("<ButtonPress>", close_if_outside, add="+")
+
+    def _joycon_ir_in_app_mapping_specs(self):
+        return (
+            ("simul", "joycon_ir_sensor_in_app_gyro_simul", "None"),
+            ("deadzone_mode", "joycon_ir_sensor_in_app_gyro_deadzone_mode", []),
+            ("deadzone_amount", "joycon_ir_sensor_in_app_gyro_deadzone_amount", 15.0),
+            ("deadzone_pause_after_pressed_ms", "joycon_ir_sensor_in_app_gyro_deadzone_pause_after_pressed_ms", 100),
+            ("deadzone_pause_after_released_ms", "joycon_ir_sensor_in_app_gyro_deadzone_pause_after_released_ms", 100),
+            ("deadzone_effect_after_released_ms", "joycon_ir_sensor_in_app_gyro_deadzone_effect_after_released_ms", 200),
+            ("dampening_mode", "joycon_ir_sensor_in_app_gyro_dampening_mode", []),
+            ("dampening_amount", "joycon_ir_sensor_in_app_gyro_dampening_amount", 90),
+            ("dampening_effect_after_released_ms", "joycon_ir_sensor_in_app_gyro_dampening_effect_after_released_ms", 200),
+        )
+
+    def _load_joycon_ir_in_app_mapping_scope(self, side, profile_name=None, category=None, mapping_scope=None):
+        for ir_key, mapping_key, default in self._joycon_ir_in_app_mapping_specs():
+            value = CONFIG.get_joycon_ir_in_app_gyro_setting_scoped(side, ir_key, default, profile_name, category, mapping_scope)
+            CONFIG.set_mapping_setting_scoped(mapping_key, value, None)
+
+    def _save_joycon_ir_in_app_mapping_scope(self, side, profile_name=None, category=None, mapping_scope=None):
+        for ir_key, mapping_key, default in self._joycon_ir_in_app_mapping_specs():
+            value = CONFIG.get_mapping_setting_scoped(mapping_key, default, None)
+            CONFIG.set_joycon_ir_in_app_gyro_setting_scoped(side, ir_key, value, profile_name, category, mapping_scope)
+
+    def _joycon_ir_live_save(self, mapping_key, value):
+        """Mirror a transient `joycon_ir_sensor_in_app_gyro_*` mapping write straight into
+        the per-side IR store so the change takes effect immediately (the runtime reads the
+        IR store, not the mapping keys). Only fires while the Joy-con IR In-app Gyro bridge
+        popup is open; the key-prefix guard keeps ordinary Joystick In-app Gyro popups from
+        writing into the IR store. Removes the need for the close-time bulk transfer."""
+        ctx = getattr(self, "_joycon_ir_in_app_live_ctx", None)
+        prefix = "joycon_ir_sensor_in_app_gyro_"
+        if not ctx or not isinstance(mapping_key, str) or not mapping_key.startswith(prefix):
+            return
+        side, profile_name, category, mapping_scope = ctx
+        CONFIG.set_joycon_ir_in_app_gyro_setting_scoped(
+            side, mapping_key[len(prefix):], value, profile_name, category, mapping_scope)
+
+    def open_joycon_ir_in_app_gyro_settings(self, side, anchor_widget, profile_name=None, category=None, mode="Hold", mapping_scope=None):
+        """Open the existing In-app Gyro settings popup for the Joy-con IR sensor.
+
+        The full popup builder currently lives inside create_mapping_widget and is
+        keyed by mapping name.  A tiny bridge widget lets the Joy-con Function button
+        reuse that builder while storing the settings under joycon_ir_sensor_* keys,
+        which the controller path already reads when the IR sensor activates In-app
+        Gyro.
+        """
+        existing = getattr(self, "in_app_gyro_popup", None)
+        if (existing is not None and existing.winfo_exists()
+                and getattr(self, "joycon_ir_in_app_gyro_anchor", None) is anchor_widget):
+            self.close_in_app_gyro_popup()
+            return
+
+        self.close_in_app_gyro_popup()
+        mode = mode if mode in ("Hold", "Tap") else "Hold"
+        self._load_joycon_ir_in_app_mapping_scope(side, profile_name, category, mapping_scope)
+        CONFIG.set_mapping_setting_scoped("joycon_ir_sensor", f"Custom[{mode}]:{IN_APP_GYRO_TOKEN}", None)
+
+        self.root.update_idletasks()
+        anchor_x = anchor_widget.winfo_rootx() - self.root.winfo_rootx()
+        anchor_y = anchor_widget.winfo_rooty() - self.root.winfo_rooty()
+        bridge = tk.Frame(self.root, bg=background_color, width=max(1, anchor_widget.winfo_width()),
+                          height=max(1, anchor_widget.winfo_height()))
+        bridge.place(in_=self.root, x=anchor_x, y=anchor_y,
+                     width=max(1, anchor_widget.winfo_width()),
+                     height=max(1, anchor_widget.winfo_height()))
+        try:
+            bridge.lower()
+        except Exception:
+            pass
+        self.joycon_ir_in_app_gyro_bridge = bridge
+        self.joycon_ir_in_app_gyro_anchor = anchor_widget
+
+        # Live-save context: every control change in the reused popup mirrors straight into
+        # the per-side IR store (via _joycon_ir_live_save), so settings take effect
+        # immediately and no bulk transfer is needed on close.
+        self._joycon_ir_in_app_live_ctx = (side, profile_name, category, mapping_scope)
+
+        self.create_mapping_widget(
+            bridge,
+            "joycon_ir_sensor",
+            "",
+            None,
+            compact=True,
+            fixed_size=(max(1, anchor_widget.winfo_width()), max(1, anchor_widget.winfo_height())),
+        )
+        suffix = self._mapping_scope_suffix(None)
+        attr_key = self._mapping_attr("joycon_ir_sensor", suffix)
+        in_app_button = getattr(self, f"{attr_key}_in_app_gyro_btn", None)
+        if in_app_button is not None and in_app_button.winfo_exists():
+            in_app_button.invoke()
+            popup = getattr(self, "in_app_gyro_popup", None)
+            if popup is not None and popup.winfo_exists():
+                # No close-time save: each control change already live-saves into the IR
+                # store via _joycon_ir_live_save, so closing does no extra (bulk) save.
+                self.in_app_gyro_popup_anchor = anchor_widget
+                popup.in_app_visible_anchor = anchor_widget
+                self._place_popup_within_root_bounds(
+                    popup,
+                    anchor_widget,
+                    requested_size=getattr(popup, "in_app_full_requested_size", None),
+                )
+                popup.lift()
 
     def open_joystick_custom_popup(self, key, anchor_widget, mapping_scope=None):
         if self._toggle_joystick_popup(anchor_widget):
@@ -6784,13 +9237,14 @@ bg_color=panel_bg, widths=[8, 10])
         header_font = scale_font(("Arial", 9, "bold"))
         btn_font = scale_font(("Arial", 9, "bold"))
         measure = tkFont.Font(font=btn_font)
+        display_label = getattr(selector, "display_label", back_button_label)
 
         # All option buttons share one size, wide enough for the longest label.
         max_label_w = 0
         for _title, rows in BACK_BUTTON_CATEGORIES:
             for row in rows:
                 for token in row:
-                    max_label_w = max(max_label_w, measure.measure(back_button_label(token)))
+                    max_label_w = max(max_label_w, measure.measure(display_label(token)))
         btn_w = max_label_w + int(16 * scaling_factor)
         btn_h = measure.metrics("linespace") + int(10 * scaling_factor)
 
@@ -6824,7 +9278,7 @@ bg_color=panel_bg, widths=[8, 10])
                     cell.grid(row=r_idx, column=c_idx, padx=(0, btn_gap), pady=(0, btn_gap), sticky="nsew")
                     cell.grid_propagate(False)
                     bd = int(2 * scaling_factor) if is_sel else 0
-                    btn = tk.Button(cell, text=back_button_label(token), font=btn_font,
+                    btn = tk.Button(cell, text=display_label(token), font=btn_font,
                                     bg=button_gray, fg="white", relief=tk.FLAT, bd=0,
                                     highlightthickness=0, takefocus=0,
                                     activebackground=highlight_color, activeforeground="white",
@@ -7424,6 +9878,264 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.profiles[profile_name]["profile_switching_combo"] = value
             CONFIG.save_config()
 
+    def _open_profile_checklist_dialog(self, title, profile_names, action_text, show_keep_current=False, show_calibration=True, calibration_confirm_message=None):
+        """Modal profile picker shared by Import and Export.
+
+        Returns ``(selected_names, keep_current, include_calibration)``; all ``None``
+        when the user cancels.  The title, Select All row, the optional Keep Current
+        Profiles row, the calibration row and the action buttons are pinned outside
+        the scrolling area.
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg=background_color)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        spacing = int(10 * scaling_factor)
+        column_gap = int(8 * scaling_factor)
+        # Match the row/checkbox height to the Add/Rename buttons, like the profile popup.
+        ref_btn = getattr(self, "add_profile_btn", None)
+        try:
+            row_height = ref_btn.winfo_reqheight() if ref_btn is not None else 0
+        except Exception:
+            row_height = 0
+        if row_height < int(10 * scaling_factor):
+            row_height = int(30 * scaling_factor)
+        profile_col_width = int(148 * 1.5 * scaling_factor)
+        row_pady = int(5 * scaling_factor)
+        max_rows = 10
+        canvas_height = (row_height + row_pady * 2) * max_rows
+
+        names = list(profile_names)
+        checked = {name: True for name in names}
+        select_all_checked = [True]
+        result = {"selected": None, "keep": None, "calibration": None}
+        keep_current = [True]
+        include_calibration = [True]
+
+        tk.Label(
+            dialog, text=title, bg=background_color, fg=text_color,
+            font=scale_font(("Arial", 11, "bold")), anchor=tk.CENTER
+        ).pack(side=tk.TOP, fill=tk.X, pady=(spacing, spacing))
+
+        # Pack the pinned footer bottom-up so the scrolling list gets the leftovers.
+        btn_frame = tk.Frame(dialog, bg=background_color)
+        btn_frame.pack(side=tk.BOTTOM, pady=(row_pady, spacing))
+
+        calibration_frame = None
+        if show_calibration:
+            calibration_frame = tk.Frame(dialog, bg=background_color)
+            calibration_frame.pack(side=tk.BOTTOM, pady=row_pady)
+
+        keep_frame = None
+        if show_keep_current:
+            keep_frame = tk.Frame(dialog, bg=background_color)
+            keep_frame.pack(side=tk.BOTTOM, pady=row_pady)
+
+        select_all_frame = tk.Frame(dialog, bg=background_color)
+        select_all_frame.pack(side=tk.BOTTOM, pady=(row_pady, row_pady))
+
+        container = tk.Frame(dialog, bg=background_color)
+        container.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=column_gap)
+        canvas = tk.Canvas(container, bg=background_color, highlightthickness=0, height=canvas_height)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollable = tk.Frame(canvas, bg=background_color)
+        canvas_window = canvas.create_window((0, 0), window=scrollable, anchor="nw")
+
+        def update_scroll(event=None):
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return
+            canvas.configure(scrollregion=bbox)
+            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
+            if scrollable.winfo_reqheight() > canvas_height:
+                if not scrollbar.winfo_ismapped():
+                    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            else:
+                if scrollbar.winfo_ismapped():
+                    scrollbar.pack_forget()
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollable.bind("<Configure>", update_scroll)
+        canvas.bind("<Configure>", update_scroll)
+
+        def on_mousewheel(event):
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return "break"
+            # Never scroll while everything already fits in view.
+            if (bbox[3] - bbox[1]) <= canvas.winfo_height():
+                return "break"
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+
+        def bind_mousewheel(widget):
+            widget.bind("<MouseWheel>", on_mousewheel)
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+
+        check_buttons = {}
+
+        def make_check_button(parent, is_checked, command):
+            btn = tk.Button(
+                parent, text="V" if is_checked else "",
+                font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white",
+                relief=tk.FLAT, bd=0, command=command
+            )
+            return btn
+
+        def make_footer_check_row(parent, label_text, command):
+            """A right-hand checkbox whose column lines up with the profile list's."""
+            inner = tk.Frame(
+                parent, bg=background_color,
+                width=profile_col_width + column_gap + row_height, height=row_height
+            )
+            inner.pack(anchor=tk.CENTER)
+            inner.pack_propagate(False)
+            inner.grid_propagate(False)
+            inner.grid_columnconfigure(0, minsize=profile_col_width)
+            inner.grid_columnconfigure(1, minsize=row_height)
+
+            label_cell = tk.Frame(inner, bg=background_color, width=profile_col_width, height=row_height)
+            label_cell.grid(row=0, column=0, sticky=tk.EW, padx=(0, column_gap))
+            label_cell.grid_propagate(False)
+            tk.Label(
+                label_cell, text=label_text, bg=background_color, fg=text_color,
+                font=scale_font(("Arial", 10, "bold")), anchor=tk.E
+            ).place(x=0, y=0, width=profile_col_width, height=row_height)
+
+            box_cell = tk.Frame(inner, bg=background_color, width=row_height, height=row_height)
+            box_cell.grid(row=0, column=1, sticky=tk.W)
+            box_cell.grid_propagate(False)
+            btn = make_check_button(box_cell, True, command)
+            btn.place(x=0, y=0, width=row_height, height=row_height)
+            return btn
+
+        def sync_select_all_button():
+            select_all_btn.config(text="V" if select_all_checked[0] else "")
+
+        def on_profile_toggled(name):
+            checked[name] = not checked[name]
+            check_buttons[name].config(text="V" if checked[name] else "")
+            # Only reflect the aggregate state here - toggling a single profile must
+            # never cascade back onto the other rows.
+            select_all_checked[0] = bool(names) and all(checked[n] for n in names)
+            sync_select_all_button()
+
+        def on_select_all_toggled():
+            # This is the only entry point that cascades: checking it selects every
+            # profile, unchecking it clears every profile.
+            select_all_checked[0] = not select_all_checked[0]
+            for name in names:
+                checked[name] = select_all_checked[0]
+                check_buttons[name].config(text="V" if checked[name] else "")
+            sync_select_all_button()
+
+        for name in names:
+            row = tk.Frame(scrollable, bg=background_color, height=row_height)
+            row.pack(side=tk.TOP, fill=tk.X, pady=row_pady)
+            row.pack_propagate(False)
+            # Keep the name + checkbox pair centered like the footer controls.
+            row_inner = tk.Frame(row, bg=background_color, height=row_height)
+            row_inner.pack(anchor=tk.CENTER, expand=True)
+            row_inner.pack_propagate(False)
+            row_inner.grid_propagate(False)
+            row_inner.configure(width=profile_col_width + column_gap + row_height)
+            row_inner.grid_columnconfigure(0, minsize=profile_col_width)
+            row_inner.grid_columnconfigure(1, minsize=row_height)
+
+            name_cell = tk.Frame(row_inner, bg=background_color, width=profile_col_width, height=row_height)
+            name_cell.grid(row=0, column=0, sticky=tk.EW, padx=(0, column_gap))
+            name_cell.grid_propagate(False)
+            name_lbl = tk.Label(
+                name_cell, text=name, font=scale_font(("Arial", 10, "bold")),
+                bg=button_gray, fg="white", anchor=tk.CENTER, padx=int(5 * scaling_factor)
+            )
+            name_lbl.place(x=0, y=0, width=profile_col_width, height=row_height)
+            # Hovering shows the full profile name when the fixed-width cell clips it.
+            Tooltip(name_lbl, lambda n=name: n)
+
+            check_cell = tk.Frame(row_inner, bg=background_color, width=row_height, height=row_height)
+            check_cell.grid(row=0, column=1, sticky=tk.W)
+            check_cell.grid_propagate(False)
+            chk_btn = make_check_button(check_cell, True, lambda n=name: on_profile_toggled(n))
+            chk_btn.place(x=0, y=0, width=row_height, height=row_height)
+            check_buttons[name] = chk_btn
+
+        select_all_btn = make_footer_check_row(select_all_frame, "Select All", on_select_all_toggled)
+
+        if keep_frame is not None:
+            def on_keep_toggled():
+                keep_current[0] = not keep_current[0]
+                keep_btn.config(text="V" if keep_current[0] else "")
+
+            keep_btn = make_footer_check_row(keep_frame, "Keep Current Profiles", on_keep_toggled)
+
+        if calibration_frame is not None:
+            def on_calibration_toggled():
+                include_calibration[0] = not include_calibration[0]
+                calibration_btn.config(text="V" if include_calibration[0] else "")
+
+            calibration_btn = make_footer_check_row(
+                calibration_frame, f"{action_text} Controller Related Data", on_calibration_toggled
+            )
+
+        def on_action():
+            selected = [name for name in names if checked[name]]
+            calibration = include_calibration[0] if calibration_frame is not None else False
+            # Profiles are optional: controller related data alone is a valid payload.
+            if not selected and not calibration:
+                self.custom_messagebox(
+                    title,
+                    "Please select at least one profile"
+                    + (" or Controller Related Data." if calibration_frame is not None else "."),
+                    type="warning",
+                )
+                dialog.grab_set()
+                return
+            if calibration and calibration_confirm_message:
+                proceed = self.custom_messagebox(
+                    title, calibration_confirm_message, type="yesno",
+                    confirm_text="Proceed", cancel_text="Cancel"
+                )
+                dialog.grab_set()
+                if not proceed:
+                    # Cancel returns to this window with the option turned off.
+                    include_calibration[0] = False
+                    calibration_btn.config(text="")
+                    return
+            result["selected"] = selected
+            result["keep"] = keep_current[0] if show_keep_current else None
+            result["calibration"] = calibration
+            dialog.destroy()
+
+        def on_cancel(event=None):
+            dialog.destroy()
+
+        tk.Button(
+            btn_frame, text=action_text, font=scale_font(("Arial", 11, "bold")),
+            bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_action
+        ).pack(side=tk.LEFT, padx=row_pady)
+        tk.Button(
+            btn_frame, text="Cancel", font=scale_font(("Arial", 11, "bold")),
+            bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_cancel
+        ).pack(side=tk.LEFT, padx=row_pady)
+
+        dialog.bind("<Escape>", on_cancel)
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        bind_mousewheel(dialog)
+        dialog.update_idletasks()
+        width = max(int(320 * scaling_factor), dialog.winfo_reqwidth() + column_gap * 2)
+        height = dialog.winfo_reqheight()
+        self.center_window_on_root(dialog, width, height)
+        dialog.grab_set()
+        update_scroll()
+        self.root.wait_window(dialog)
+        return result["selected"], result["keep"], result["calibration"]
+
     def init_settings_panel(self):
         self.settings_frame = tk.Frame(self.root, bg=background_color)
         self.settings_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(int(5 * scaling_factor), 0))
@@ -7468,6 +10180,12 @@ bg_color=panel_bg, widths=[8, 10])
         self.rename_profile_btn = tk.Button(row_profile, text="Rename", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_rename_profile)
         self.rename_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
         
+        self.import_profile_btn = tk.Button(row_profile, text="Import", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_import_profiles)
+        self.import_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
+        self.export_profile_btn = tk.Button(row_profile, text="Export", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_export_profiles)
+        self.export_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
         self.reset_profile_btn = tk.Button(row_profile, text="Reset", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_reset_profile)
         self.reset_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
 
@@ -7484,7 +10202,16 @@ bg_color=panel_bg, widths=[8, 10])
         
         # Driver Switch
         tk.Label(row_global, text="Driver:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.driver_switch = ToggleSwitch(row_global, ["WinUHid", "ViGEmBus", "USBIP"], ["WinUHid", "ViGEmBus", "USBIP"], getattr(CONFIG, "driver_type", "WinUHid"), self.update_driver_type_setting, background_color)
+        # MSIX can expose WinUHid only when a healthy copy was installed
+        # separately.  It never bundles or installs the driver itself.
+        _winuhid_available = packaged_winuhid_available()
+        _driver_opts = (["WinUHid", "ViGEmBus", "USBIP"]
+                        if (not utils.is_packaged() or _winuhid_available)
+                        else ["ViGEmBus", "USBIP"])
+        _driver_current = getattr(CONFIG, "driver_type", "WinUHid")
+        if _driver_current not in _driver_opts:
+            _driver_current = _driver_opts[0]
+        self.driver_switch = ToggleSwitch(row_global, _driver_opts, _driver_opts, _driver_current, self.update_driver_type_setting, background_color)
         self.driver_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Emu Mode
@@ -7512,6 +10239,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.rumble_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         self.audio_haptics_button = tk.Button(row_vibration, text="Audio Haptics Settings", command=lambda: self.open_audio_haptics_settings(self.audio_haptics_button), font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, activebackground=highlight_color, padx=int(10 * scaling_factor))
         self.audio_haptics_button.pack(side=tk.LEFT, padx=(int(10 * scaling_factor), 0))
+        self.impulse_trigger_button = tk.Button(row_vibration, text="Impulse Trigger Settings", command=lambda: self.open_impulse_trigger_settings(self.impulse_trigger_button), font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, activebackground=highlight_color, padx=int(10 * scaling_factor))
         self.update_dynamic_rumble_mode_options()
 
         self.strength_label = tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
@@ -7570,17 +10298,6 @@ bg_color=panel_bg, widths=[8, 10])
         self.controller_mapping_frame = tk.Frame(self.tab_content_frame, bg=tab_black)
         self.in_app_gyro_mode_mapping_frame = tk.Frame(self.tab_content_frame, bg=tab_black)
 
-        row_mouse = tk.Frame(self.controller_mapping_frame, bg=tab_black); row_mouse.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_mouse, text="Joy-con Mouse:", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.mouse_switch = ToggleSwitch(row_mouse, ["ON", "OFF"], [True, False], CONFIG.mouse_config.enabled, self.update_mouse_setting, tab_black)
-        self.mouse_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
-        tk.Label(row_mouse, text="Sensitivity:", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.mouse_sens_scale = tk.Scale(row_mouse, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=tab_black, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.update_mouse_sensitivity)
-        self.mouse_sens_scale.set(CONFIG.mouse_config.sensitivity); self.mouse_sens_scale.pack(side=tk.LEFT)
-        tk.Label(row_mouse, text="Activate Threshold:", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.ir_activate_scale = tk.Scale(row_mouse, from_=1, to=3, resolution=1, orient=tk.HORIZONTAL, length=int(80 * scaling_factor), bg=tab_black, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.update_ir_activate_threshold)
-        self.ir_activate_scale.set(CONFIG.mouse_config.ir_activate_threshold); self.ir_activate_scale.pack(side=tk.LEFT)
-
         shared_frame = tk.LabelFrame(self.controller_mapping_frame, text=" Shared Buttons & Joysticks ", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold")), bd=1, relief=tk.GROOVE, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor))
         shared_frame.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor), padx=(int(5 * scaling_factor), 0))
 
@@ -7602,6 +10319,13 @@ bg_color=panel_bg, widths=[8, 10])
         self.create_mapping_widget(row_shared_3, "l_stk", "L Joystick Click:")
         self.create_joystick_mapping_widget(row_shared_3, "r_joystick", "R Joystick:")
         self.create_mapping_widget(row_shared_3, "r_stk", "R Joystick Click:")
+        self.joystick_deadzone_button = tk.Button(
+            row_shared_3, text="Joystick Deadzone Settings",
+            command=lambda: self.open_joystick_deadzone_settings(self.joystick_deadzone_button),
+            font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color,
+            relief=tk.FLAT, bd=0, activebackground=highlight_color,
+            padx=int(10 * scaling_factor))
+        self.joystick_deadzone_button.pack(side=tk.LEFT, padx=(int(10 * scaling_factor), 0))
 
         row_shared_4 = shared_mapping_row()
         for key, label in [("a", "A:"), ("b", "B:"), ("x", "X:"), ("y", "Y:")]:
@@ -7620,6 +10344,14 @@ bg_color=panel_bg, widths=[8, 10])
         tk.Label(row_jc, text="Joy-con Rail Buttons:", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         for key, label in [("sll", "Left SL:"), ("srl", "Left SR:"), ("slr", "Right SL:"), ("srr", "Right SR:")]:
             self.create_mapping_widget(row_jc, key, label)
+
+        row_ir = tk.Frame(self.controller_mapping_frame, bg=tab_black); row_ir.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
+        tk.Label(row_ir, text="Joy-con IR Sensor:", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        self.joycon_ir_left_button = tk.Button(row_ir, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, command=lambda: self.open_joycon_ir_sensor_settings("left", self.joycon_ir_left_button))
+        self.joycon_ir_left_button.pack(side=tk.LEFT, padx=int(3 * scaling_factor))
+        self.joycon_ir_right_button = tk.Button(row_ir, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, command=lambda: self.open_joycon_ir_sensor_settings("right", self.joycon_ir_right_button))
+        self.joycon_ir_right_button.pack(side=tk.LEFT, padx=int(3 * scaling_factor))
+        self.refresh_joycon_ir_sensor_buttons()
 
         row_gc = tk.Frame(self.controller_mapping_frame, bg=tab_black); row_gc.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_gc, text="GameCube Controller:", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
@@ -7710,6 +10442,14 @@ bg_color=panel_bg, widths=[8, 10])
         for key, label in [("sll", "Left SL:"), ("srl", "Left SR:"), ("slr", "Right SL:"), ("srr", "Right SR:")]:
             self.create_mapping_widget(gyro_row_jc, key, label, gyro_mapping_scope)
 
+        gyro_row_ir = tk.Frame(self.in_app_gyro_mode_mapping_frame, bg=tab_black); gyro_row_ir.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
+        tk.Label(gyro_row_ir, text="Joy-con IR Sensor:", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        self.gyro_joycon_ir_left_button = tk.Button(gyro_row_ir, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, command=lambda: self.open_joycon_ir_sensor_settings("left", self.gyro_joycon_ir_left_button, gyro_mapping_scope))
+        self.gyro_joycon_ir_left_button.pack(side=tk.LEFT, padx=int(3 * scaling_factor))
+        self.gyro_joycon_ir_right_button = tk.Button(gyro_row_ir, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, command=lambda: self.open_joycon_ir_sensor_settings("right", self.gyro_joycon_ir_right_button, gyro_mapping_scope))
+        self.gyro_joycon_ir_right_button.pack(side=tk.LEFT, padx=int(3 * scaling_factor))
+        self.refresh_joycon_ir_sensor_buttons()
+
         gyro_row_gc = tk.Frame(self.in_app_gyro_mode_mapping_frame, bg=tab_black); gyro_row_gc.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(gyro_row_gc, text="GameCube Controller:", bg=tab_black, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
 
@@ -7791,6 +10531,7 @@ bg_color=panel_bg, widths=[8, 10])
         # scope (synced at config level) is reflected in the comboboxes.
         if tab_id in ("controller_mapping", "in_app_gyro_mode_mapping"):
             self._refresh_mapping_comboboxes()
+            self.refresh_joycon_ir_sensor_buttons()
         try:
             self.root.update_idletasks()
         except Exception:
@@ -7819,38 +10560,714 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.adaptive_triggers_enabled = val
             CONFIG.save_config()
 
-        row1 = tk.Frame(content_frame, bg=background_color)
-        row1.pack(fill=tk.X, pady=(0, int(15 * scaling_factor)))
-        tk.Label(row1, text="Audio Haptics:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, width=15, anchor="w").pack(side=tk.LEFT)
-        ToggleSwitch(row1, ["On", "Off"], [True, False], getattr(CONFIG, "audio_haptics_enabled", True), update_audio_haptics, background_color).pack(side=tk.RIGHT)
+        # Use a shared, natural-width grid column instead of Label.width.
+        # Label.width is character-cell based and created asymmetric visual
+        # padding with proportional bold fonts.
+        audio_label = tk.Label(content_frame, text="Audio Haptics:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        audio_label.grid(row=0, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(0, int(15 * scaling_factor)))
+        ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, "audio_haptics_enabled", True), update_audio_haptics, background_color).grid(row=0, column=1, sticky=tk.W, pady=(0, int(15 * scaling_factor)))
 
-        row2 = tk.Frame(content_frame, bg=background_color)
-        row2.pack(fill=tk.X)
-        tk.Label(row2, text="Adaptive Triggers:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, width=15, anchor="w").pack(side=tk.LEFT)
-        ToggleSwitch(row2, ["On", "Off"], [True, False], getattr(CONFIG, "adaptive_triggers_enabled", True), update_adaptive_triggers, background_color).pack(side=tk.RIGHT)
+        adaptive_label = tk.Label(content_frame, text="Adaptive Triggers:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        adaptive_label.grid(row=1, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)))
+        ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, "adaptive_triggers_enabled", True), update_adaptive_triggers, background_color).grid(row=1, column=1, sticky=tk.W)
 
         popup.update_idletasks()
         self._place_popup_within_root_bounds(popup, anchor_widget)
         self.root.after(100, self.bind_joystick_custom_popup_outside_click)
 
-    def _prerender_settings_tabs(self):
-        # Realize and paint every settings tab once (call while the window is invisible)
-        # so the first real switch to each tab doesn't flash its default white background:
-        # the flash only happens the first time a frame's widgets are mapped.
-        active = getattr(self, "settings_active_tab", "controller_mapping")
-        for tab in list(getattr(self, "settings_tab_buttons", {}).keys()):
-            if tab == active:
-                continue
+    def open_impulse_trigger_settings(self, anchor_widget):
+        if self._toggle_joystick_popup(anchor_widget):
+            return
+        popup = self._create_joystick_option_popup(anchor_widget, defer_place=True)
+
+        content_frame = tk.Frame(popup, bg=background_color)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor))
+
+        def clear_active_xbox_impulses():
+            for vc in VIRTUAL_CONTROLLERS:
+                if (vc is not None and getattr(vc, 'mode', '') == "Xbox One"
+                        and getattr(vc, 'driver_type', '') == "WinUHid"):
+                    try:
+                        vc.clear_xbox_impulse_triggers()
+                    except Exception:
+                        pass
+
+        def update_impulse_enabled(value):
+            CONFIG.impulse_trigger_enabled = value
+            CONFIG.save_config()
+            if not value:
+                clear_active_xbox_impulses()
+
+        def update_dynamic_frequency(value):
+            CONFIG.impulse_trigger_dynamic_frequency = value
+            CONFIG.save_config()
+            refresh_frequency_visibility()
+
+        def update_fixed_frequency(value):
+            CONFIG.impulse_trigger_frequency = int(float(value))
+            CONFIG.save_config()
+
+        def update_impulse_strength(value):
+            CONFIG.impulse_trigger_strength = int(float(value))
+            CONFIG.save_config()
+
+        def refresh_frequency_visibility():
+            if getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True):
+                frequency_label.grid_remove()
+                frequency_scale.grid_remove()
+            else:
+                frequency_label.grid()
+                frequency_scale.grid()
+            popup.update_idletasks()
+            self._place_popup_within_root_bounds(popup, anchor_widget)
+
+        # A shared two-column grid gives a natural-width title column: its
+        # longest label starts at the real popup padding, while all titles
+        # still share a right edge and all controls share a left edge.
+        impulse_label = tk.Label(content_frame, text="Impulse Trigger:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        impulse_label.grid(row=0, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(0, int(15 * scaling_factor)))
+        ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, 'impulse_trigger_enabled', True), update_impulse_enabled, background_color).grid(row=0, column=1, sticky=tk.W, pady=(0, int(15 * scaling_factor)))
+
+        dynamic_label = tk.Label(content_frame, text="Dynamic Frequency:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        dynamic_label.grid(row=1, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)))
+        ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True), update_dynamic_frequency, background_color).grid(row=1, column=1, sticky=tk.W)
+
+        strength_label = tk.Label(content_frame, text="Strength:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        strength_label.grid(row=2, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(int(15 * scaling_factor), 0))
+        strength_scale = tk.Scale(content_frame, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=update_impulse_strength)
+        strength_scale.set(getattr(CONFIG, 'impulse_trigger_strength', 5))
+        strength_scale.grid(row=2, column=1, sticky=tk.W, pady=(int(15 * scaling_factor), 0))
+
+        frequency_label = tk.Label(content_frame, text="Frequency:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        frequency_label.grid(row=3, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(int(15 * scaling_factor), 0))
+        frequency_scale = tk.Scale(content_frame, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=update_fixed_frequency)
+        frequency_scale.set(getattr(CONFIG, 'impulse_trigger_frequency', 10))
+        frequency_scale.grid(row=3, column=1, sticky=tk.W, pady=(int(15 * scaling_factor), 0))
+
+        refresh_frequency_visibility()
+        self.root.after(100, self.bind_joystick_custom_popup_outside_click)
+
+    def open_joystick_deadzone_settings(self, anchor_widget):
+        """Open the Profile × Emu Mode physical joystick deadzone editor."""
+        if self._toggle_joystick_popup(anchor_widget):
+            return
+        popup = self._create_joystick_option_popup(anchor_widget, defer_place=True)
+        profile_name = CONFIG.active_profile
+        category = CONFIG.get_current_category()
+        content = tk.Frame(popup, bg=background_color)
+        content.pack(fill=tk.BOTH, expand=True, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor))
+        syncing = {"value": False, "dirty": False}
+        rows = {}
+        # Keep the link icon at the exact former Entry-based size. Sliders are taller
+        # than the old controls and must not enlarge this button.
+        icon_images_by_height = {}
+        popup.joystick_deadzone_icon_images = icon_images_by_height
+
+        icon_size_reference = tk.Entry(
+            content, width=3, font=scale_font(("Arial", 11, "bold")), bd=0)
+        previous_entry_height = icon_size_reference.winfo_reqheight()
+        icon_size_reference.destroy()
+
+        def get_icon_images(entry_height):
+            icon_height = max(1, int(round(entry_height * 0.8)))
+            if icon_height not in icon_images_by_height:
+                icon_images_by_height[icon_height] = {}
+                for icon_name in ("link", "unlink"):
+                    image = Image.open(get_resource(f"images/{icon_name}.png"))
+                    image = image.resize((icon_height, icon_height), Image.Resampling.LANCZOS)
+                    icon_images_by_height[icon_height][icon_name] = ImageTk.PhotoImage(image)
+            return icon_images_by_height[icon_height]
+
+        def commit_row(family, side=None):
+            row = rows[family]
+            selected = ("left", "right") if side is None else (side,)
+            changed = False
+            for current_side in selected:
+                CONFIG.set_joystick_deadzone_percent(
+                    family, current_side, row[current_side].get(), profile_name, category)
+                changed = True
+            values = CONFIG.get_joystick_deadzone_settings(profile_name, category)[family]
+            syncing["value"] = True
+            row["left"].set(values["left"])
+            row["right"].set(values["right"])
+            syncing["value"] = False
+            syncing["dirty"] = syncing["dirty"] or changed
+            return changed
+
+        def sync_from_slider(family, side, value):
+            if syncing["value"]:
+                return
+            CONFIG.set_joystick_deadzone_percent(family, side, int(float(value)), profile_name, category)
+            values = CONFIG.get_joystick_deadzone_settings(profile_name, category)[family]
+            if values["linked"]:
+                other = "right" if side == "left" else "left"
+                syncing["value"] = True
+                rows[family][other].set(values[other])
+                syncing["value"] = False
+            syncing["dirty"] = True
+
+        def toggle_link(family):
+            values = CONFIG.get_joystick_deadzone_settings(profile_name, category)[family]
+            values = CONFIG.set_joystick_deadzone_linked(family, not values["linked"], profile_name, category)
+            syncing["value"] = True
+            rows[family]["left"].set(values["left"])
+            rows[family]["right"].set(values["right"])
+            syncing["value"] = False
+            rows[family]["refresh_link"]()
+            syncing["dirty"] = True
+
+        def commit_all():
+            for family in rows:
+                commit_row(family)
+            if syncing["dirty"]:
+                CONFIG.save_config()
+                syncing["dirty"] = False
+
+        for grid_row, (family, title) in enumerate((
+                ("pro_controller", "Pro Controller:"),
+                ("joycon", "Joy-Con:"),
+                ("nso_gamecube_controller", "NSO GameCube Controller:"))):
+            row_pady = (0, int(10 * scaling_factor)) if grid_row < 2 else (0, 0)
+            values = CONFIG.get_joystick_deadzone_settings(profile_name, category)[family]
+            tk.Label(content, text=title, bg=background_color, fg=text_color,
+                     font=scale_font(("Arial", 11, "bold")), anchor=tk.E).grid(
+                         row=grid_row, column=0, sticky=tk.E,
+                         padx=(0, int(8 * scaling_factor)), pady=row_pady)
+            tk.Label(content, text="L Joystick:", bg=background_color, fg=text_color,
+                     font=scale_font(("Arial", 11, "bold")), anchor=tk.E).grid(row=grid_row, column=1, sticky=tk.E)
+            left_var, right_var = tk.IntVar(value=values["left"]), tk.IntVar(value=values["right"])
+            rows[family] = {"left": left_var, "right": right_var}
+            slider_options = {
+                "from_": 0, "to": 100, "resolution": 1, "orient": tk.HORIZONTAL,
+                "length": int(120 * scaling_factor), "bg": background_color,
+                "fg": text_color, "troughcolor": button_gray,
+                "activebackground": highlight_color, "highlightthickness": 0,
+                "bd": 0, "sliderrelief": tk.FLAT,
+                "sliderlength": int(15 * scaling_factor), "width": int(15 * scaling_factor),
+                "font": scale_font(("Arial", 10, "bold")),
+            }
+            left = tk.Scale(
+                content, variable=left_var,
+                command=lambda value, f=family: sync_from_slider(f, "left", value),
+                **slider_options)
+            left.grid(row=grid_row, column=2, sticky=tk.W, padx=(int(4 * scaling_factor), 0))
+            icon_images = get_icon_images(previous_entry_height)
+            link_button = tk.Button(content, image=icon_images["unlink"], bg=background_color,
+                                    activebackground=background_color, relief=tk.FLAT, bd=0,
+                                    highlightthickness=0, cursor="hand2", padx=0, pady=0)
+            # grid's default placement is centered; sticky only accepts n/e/s/w.
+            link_button.grid(row=grid_row, column=3, padx=int(8 * scaling_factor))
+            tk.Label(content, text="R Joystick:", bg=background_color, fg=text_color,
+                     font=scale_font(("Arial", 11, "bold")), anchor=tk.E).grid(row=grid_row, column=4, sticky=tk.E)
+            right = tk.Scale(
+                content, variable=right_var,
+                command=lambda value, f=family: sync_from_slider(f, "right", value),
+                **slider_options)
+            right.grid(row=grid_row, column=5, sticky=tk.W, padx=(int(4 * scaling_factor), 0))
+            def refresh_link(f=family, button=link_button):
+                linked = CONFIG.get_joystick_deadzone_settings(profile_name, category)[f]["linked"]
+                button.config(image=icon_images["link" if linked else "unlink"])
+            rows[family]["refresh_link"] = refresh_link
+            refresh_link()
+            link_button.config(command=lambda f=family: toggle_link(f))
+            # Every cell in this row must reserve the same vertical padding.
+            # Otherwise only the controller label is shifted by the row gap.
+            for widget in content.grid_slaves(row=grid_row):
+                widget.grid_configure(pady=row_pady)
+
+        self.joystick_deadzone_popup_commit = commit_all
+        popup.update_idletasks()
+        self._place_popup_within_root_bounds(popup, anchor_widget)
+        self.root.after(100, self.bind_joystick_custom_popup_outside_click)
+
+    def _joycon_ir_popup_layout(self, popup):
+        """The same two-column geometry used by the In-app Gyro popup."""
+        content = tk.Frame(popup, bg=background_color)
+        content.pack(side=tk.TOP, anchor=tk.CENTER)
+        control_font = scale_font(("Arial", 10, "bold"))
+        measure = tkFont.Font(font=control_font)
+        control_width = measure.measure("0" * 14) + int(18 * scaling_factor)
+        control_height = measure.metrics("linespace") + int(10 * scaling_factor)
+        rows = []
+
+        def row(label_text, pady_top=0):
+            index = len(rows)
+            label = tk.Label(content, text=label_text, bg=background_color, fg=text_color,
+                             font=scale_font(("Arial", 11, "bold")), anchor=tk.E)
+            cell = tk.Frame(content, bg=background_color, width=control_width,
+                            height=control_height)
+            cell.grid_propagate(False)
+            label.grid(row=index, column=0, sticky=tk.E,
+                       padx=(0, int(5 * scaling_factor)), pady=(pady_top, 0))
+            cell.grid(row=index, column=1, sticky=tk.W, pady=(pady_top, 0))
+            rows.append(label)
+            return cell
+
+        def finalize():
+            popup.update_idletasks()
+            label_width = max((item.winfo_reqwidth() for item in rows), default=0)
+            content.grid_columnconfigure(0, minsize=label_width)
+            content.grid_columnconfigure(1, minsize=control_width)
+
+        return row, finalize, control_font, control_width, control_height
+
+    def _close_joycon_ir_switch_input_popup(self):
+        popup = getattr(self, "joycon_ir_switch_input_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+        self.joycon_ir_switch_input_popup = None
+        self.joycon_ir_switch_input_popup_anchor = None
+        bind_id = getattr(self, "joycon_ir_switch_input_popup_bind_id", None)
+        if bind_id:
             try:
-                self.show_settings_tab(tab)
-                self.root.update_idletasks()
+                self.root.unbind("<ButtonPress>", bind_id)
             except Exception:
                 pass
-        try:
-            self.show_settings_tab(active)
-            self.root.update_idletasks()
-        except Exception:
-            pass
+        self.joycon_ir_switch_input_popup_bind_id = None
+
+    def _open_joycon_ir_switch_input_popup(self, anchor_widget, selected, on_change):
+        """IR Mouse uses the exact multi-select behaviour of Trigger Deadzone."""
+        existing = getattr(self, "joycon_ir_switch_input_popup", None)
+        if existing is not None and existing.winfo_exists() and getattr(self, "joycon_ir_switch_input_popup_anchor", None) is anchor_widget:
+            self._close_joycon_ir_switch_input_popup()
+            return
+        self._close_joycon_ir_switch_input_popup()
+        spacing = int(10 * scaling_factor)
+        gap = int(5 * scaling_factor)
+        font = scale_font(("Arial", 9, "bold"))
+        measure = tkFont.Font(font=font)
+        selected = set(normalize_dampening_inputs(selected))
+        button_width = max(measure.measure(back_button_label(token)) for token in SWITCH_INPUT_DAMPENING_OPTIONS) + int(16 * scaling_factor)
+        button_height = measure.metrics("linespace") + int(10 * scaling_factor)
+        popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID,
+                         padx=int(8 * scaling_factor), pady=spacing)
+        self.joycon_ir_switch_input_popup = popup
+        self.joycon_ir_switch_input_popup_anchor = anchor_widget
+        block = tk.Frame(popup, bg=background_color)
+        block.pack(side=tk.TOP, anchor=tk.W)
+        # Keep the Trigger Deadzone matrix and toggle semantics intact.  Empty is
+        # represented by the anchor text "None", not by an extra option cell.
+        from config import BACK_BUTTON_CATEGORIES
+        columns = dict(BACK_BUTTON_CATEGORIES)["Switch Input"]
+        button_refs = {}
+
+        def set_button_state(token):
+            cell, btn = button_refs[token]
+            is_selected = token in selected
+            border = int(2 * scaling_factor) if is_selected else 0
+            cell.config(bg=highlight_color if is_selected else background_color)
+            btn.place(x=border, y=border, width=button_width - border * 2,
+                      height=button_height - border * 2)
+
+        def toggle_token(token):
+            if token in selected:
+                selected.remove(token)
+            else:
+                selected.add(token)
+            ordered = [item for item in SWITCH_INPUT_DAMPENING_OPTIONS if item in selected]
+            on_change(ordered)
+            set_button_state(token)
+
+        for col_index, column in enumerate(columns):
+            for row_index, token in enumerate(column):
+                selected_now = token in selected
+                cell = tk.Frame(block, bg=highlight_color if selected_now else background_color,
+                                width=button_width, height=button_height)
+                cell.grid(row=row_index, column=col_index, padx=(0, gap), pady=(0, gap), sticky="nsew")
+                cell.grid_propagate(False)
+                border = int(2 * scaling_factor) if selected_now else 0
+                btn = tk.Button(cell, text=back_button_label(token), font=font, bg=button_gray,
+                                fg="white", relief=tk.FLAT, bd=0, highlightthickness=0,
+                                activebackground=highlight_color, activeforeground="white",
+                                command=lambda value=token: toggle_token(value))
+                button_refs[token] = (cell, btn)
+                set_button_state(token)
+        popup.place(in_=self.root, x=-10000, y=-10000)
+        popup.update_idletasks()
+        self._place_popup_within_root_bounds(popup, anchor_widget)
+
+        def close_if_outside(event):
+            current = getattr(self, "joycon_ir_switch_input_popup", None)
+            if current is None or not current.winfo_exists():
+                self._close_joycon_ir_switch_input_popup()
+                return
+            if self._event_in_widget(current, event) or self._event_in_widget(anchor_widget, event):
+                return
+            # Clicking in the owning IR Mouse popup is not outside its parent, but it
+            # should dismiss the previous selector before another control is used.
+            self._close_joycon_ir_switch_input_popup()
+
+        self.joycon_ir_switch_input_popup_bind_id = self.root.bind("<ButtonPress>", close_if_outside, add="+")
+
+    def refresh_joycon_ir_sensor_buttons(self):
+        button_specs = (
+            (None, "left", getattr(self, "joycon_ir_left_button", None)),
+            (None, "right", getattr(self, "joycon_ir_right_button", None)),
+            ("in_app_gyro_mode_mappings", "left", getattr(self, "gyro_joycon_ir_left_button", None)),
+            ("in_app_gyro_mode_mappings", "right", getattr(self, "gyro_joycon_ir_right_button", None)),
+        )
+        for mapping_scope, side, button in button_specs:
+            if button is not None:
+                value = CONFIG.get_joycon_ir_sensor_settings_scoped(side, scope=mapping_scope).get("function", "Default")
+                if value == "Default":
+                    label = "IR Mouse"
+                elif isinstance(value, str) and value.startswith("Custom"):
+                    payload = value.split(":", 1)[-1]
+                    label = {IN_APP_GYRO_TOKEN: IN_APP_GYRO_LABEL, MODE_SHIFT_TOKEN: MODE_SHIFT_LABEL,
+                             GYRO_LOCK_TOKEN: GYRO_LOCK_LABEL}.get(
+                                 payload,
+                                 back_button_label(MOUSE_CLICK_CUSTOM_TOKENS[payload])
+                                 if payload in MOUSE_CLICK_CUSTOM_TOKENS else "Custom")
+                else:
+                    label = back_button_label(value)
+                button.config(text=f"{'Left' if side == 'left' else 'Right'} Joy-con: {label}")
+
+    def open_joycon_ir_sensor_settings(self, side, anchor_widget, mapping_scope=None):
+        if self._toggle_joystick_popup(anchor_widget):
+            return
+        # Freeze the edited scope for the entire parent/child popup lifetime.
+        profile_name, category = CONFIG.active_profile, CONFIG.get_current_category()
+        popup = self._create_joystick_option_popup(anchor_widget, defer_place=True)
+        popup.joycon_ir_context = (side, profile_name, category, mapping_scope)
+        settings = CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope)
+        create_row, finalize, control_font, control_width, control_height = self._joycon_ir_popup_layout(popup)
+        function_cell = create_row("Function:")
+        # Normal Function state must match Trigger Deadzone exactly.  Only a
+        # compound special action grows this cell at runtime.
+        compound_width = max(control_width, tkFont.Font(font=control_font).measure("In-app Gyro") + int(105 * scaling_factor))
+        function_cell.config(width=control_width)
+        holder = tk.Frame(function_cell, bg=background_color, width=control_width, height=control_height)
+        holder.pack(side=tk.LEFT)
+        holder.pack_propagate(False)
+        selector = BackButtonSelector(holder, self, font=control_font, auto_fit=False,
+                                      display_overrides={"Default": "Default (IR Mouse)"})
+        selector.config(width=14)
+
+        def canonical(value):
+            aliases = {"In-app Gyro": f"Custom[Hold]:{IN_APP_GYRO_TOKEN}",
+                       "Gyro": f"Custom[Hold]:{IN_APP_GYRO_TOKEN}",
+                       "Mode Shift": f"Custom[Hold]:{MODE_SHIFT_TOKEN}",
+                       "Gyro Lock": f"Custom[Hold]:{GYRO_LOCK_TOKEN}"}
+            if value in MOUSE_CLICK_BACK_BUTTON_TOKENS:
+                return f"Custom[Hold]:{MOUSE_CLICK_BACK_BUTTON_TOKENS[value]}"
+            return aliases.get(value, value)
+
+        mode_var = tk.StringVar(value="Hold")
+        mode_btn = tk.Button(holder, text="Hold", bg=button_gray, fg="white",
+                             font=scale_font(("Arial", 9, "bold")), relief=tk.FLAT, bd=0, width=4)
+        action_btn = tk.Button(holder, bg=button_gray, fg="white", font=control_font,
+                               relief=tk.FLAT, bd=0)
+        close_btn = tk.Button(holder, text="X", bg="#ff4444", fg="white", font=control_font,
+                              relief=tk.FLAT, bd=0)
+        record_entry = RecordingEntry(holder, normal_font=scale_font(("Arial", 11, "bold")),
+                                      prefix_font=scale_font(("Arial", 8, "bold")), width=11,
+                                      bg=button_gray, fg="white")
+        Tooltip(record_entry, record_entry.get)
+
+        def custom_parts(value):
+            if value.startswith("Custom[Tap]:"):
+                return "Tap", value[12:]
+            if value.startswith("Custom[Hold]:"):
+                return "Hold", value[13:]
+            return "Hold", value[7:] if value.startswith("Custom:") else ""
+
+        def is_in_app_gyro_function(value):
+            if not isinstance(value, str) or not value.startswith("Custom"):
+                return False
+            _mode, payload = custom_parts(value)
+            return payload == IN_APP_GYRO_TOKEN
+
+        def set_function(value, save=True):
+            old_value = CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope).get("function", "Default")
+            value = canonical(value)
+            leaving_in_app_gyro = is_in_app_gyro_function(old_value) and not is_in_app_gyro_function(value)
+            if leaving_in_app_gyro:
+                self.close_in_app_gyro_popup()
+            CONFIG.set_joycon_ir_sensor_setting_scoped(side, "function", value, profile_name, category, mapping_scope)
+            if leaving_in_app_gyro:
+                CONFIG.reset_joycon_ir_in_app_gyro_settings_scoped(side, profile_name, category, mapping_scope)
+            if save:
+                CONFIG.save_config()
+            self.refresh_joycon_ir_sensor_buttons()
+            refresh_function(value)
+
+        def clear_function():
+            self.close_joycon_ir_mouse_popup()
+            self._close_joycon_ir_switch_input_popup()
+            selector.set("None")
+            set_function("None")
+
+        close_btn.config(command=clear_function)
+
+        def toggle_mode():
+            value = CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope).get("function", "None")
+            if not isinstance(value, str) or not value.startswith("Custom"):
+                return
+            old_mode, payload = custom_parts(value)
+            new_mode = "Tap" if old_mode == "Hold" else "Hold"
+            mode_var.set(new_mode)
+            mode_btn.config(text=new_mode)
+            set_function(f"Custom[{new_mode}]:{payload}")
+
+        mode_btn.config(command=toggle_mode)
+
+        def begin_custom_recording(_event=None):
+            value = CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope).get("function", "Custom")
+            mode, _payload = custom_parts(value if isinstance(value, str) else "Custom")
+            mode_var.set(mode)
+            mode_btn.config(text=mode)
+            self.start_custom_recording(
+                "joycon_ir_sensor", record_entry, selector, holder, mode_var,
+                value_writer=lambda recorded: CONFIG.set_joycon_ir_sensor_setting_scoped(side, "function", recorded, profile_name, category, mapping_scope),
+                empty_writer=lambda: CONFIG.set_joycon_ir_sensor_setting_scoped(side, "function", "Default", profile_name, category, mapping_scope),
+                complete_callback=lambda _value: (CONFIG.save_config(), self.refresh_joycon_ir_sensor_buttons(), refresh_function(), self.root.after(100, self.bind_joystick_custom_popup_outside_click)),
+            )
+
+        record_entry.bind("<Button-1>", begin_custom_recording)
+
+        def open_action_popup():
+            value = CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope).get("function", "None")
+            if value == "Default":
+                self.open_joycon_ir_mouse_settings(side, action_btn, profile_name, category, mapping_scope)
+            elif value == "Change Profile":
+                self.open_change_profile_popup(action_btn)
+                self.joycon_ir_change_profile_popup = getattr(self, "change_profile_popup", None)
+            elif isinstance(value, str) and value.startswith("Custom"):
+                mode, payload = custom_parts(value)
+                if payload == IN_APP_GYRO_TOKEN:
+                    self.open_joycon_ir_in_app_gyro_settings(side, action_btn, profile_name, category, mode, mapping_scope)
+
+        action_btn.config(command=open_action_popup)
+
+        def select_function_popup_value(token, button=action_btn):
+            if token in MOUSE_CLICK_BACK_BUTTON_TOKENS:
+                button._mouse_click_token = token
+            set_function(token)
+
+        def refresh_function(value=None):
+            value = value if value is not None else CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope).get("function", "Default")
+            selector.pack_forget(); mode_btn.pack_forget(); action_btn.pack_forget(); record_entry.pack_forget(); close_btn.pack_forget()
+            action_btn._mouse_click_token = "None"
+            action_btn.get = lambda button=action_btn: getattr(button, "_mouse_click_token", "None")
+            action_btn.display_label = back_button_label
+            action_btn.select_value = select_function_popup_value
+            is_compound = isinstance(value, str) and value.startswith("Custom")
+            active_width = compound_width if is_compound else control_width
+            function_cell.config(width=active_width, height=control_height)
+            holder.config(width=active_width, height=control_height)
+            popup.update_idletasks()
+            self._place_popup_within_root_bounds(popup, anchor_widget)
+            if value == "Default":
+                action_btn.config(text="IR Mouse")
+                action_btn.config(command=open_action_popup)
+                action_btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                close_btn.pack(side=tk.LEFT, fill=tk.Y, padx=(int(2 * scaling_factor), 0))
+            elif value == "Change Profile":
+                action_btn.config(text="Change Profile")
+                action_btn.config(command=open_action_popup)
+                action_btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                close_btn.pack(side=tk.LEFT, fill=tk.Y, padx=(int(2 * scaling_factor), 0))
+            elif isinstance(value, str) and value.startswith("Custom"):
+                mode, payload = custom_parts(value)
+                mode_var.set(mode)
+                mode_btn.config(text=mode)
+                mode_btn.pack(side=tk.LEFT, fill=tk.Y, padx=(0, int(2 * scaling_factor)))
+                special_text = {IN_APP_GYRO_TOKEN: IN_APP_GYRO_LABEL,
+                                MODE_SHIFT_TOKEN: MODE_SHIFT_LABEL,
+                                GYRO_LOCK_TOKEN: GYRO_LOCK_LABEL}.get(payload)
+                mouse_token = MOUSE_CLICK_CUSTOM_TOKENS.get(payload)
+                if special_text or mouse_token:
+                    action_btn.config(text=special_text or back_button_label(mouse_token))
+                    if mouse_token:
+                        action_btn._mouse_click_token = mouse_token
+                        action_btn.config(command=lambda button=action_btn: self.open_back_button_popup(button))
+                    else:
+                        action_btn.config(command=open_action_popup)
+                    action_btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                    if not mouse_token:
+                        close_btn.pack(side=tk.LEFT, fill=tk.Y, padx=(int(2 * scaling_factor), 0))
+                else:
+                    record_entry.config(state="normal")
+                    record_entry.delete(0, tk.END)
+                    record_entry.insert(0, format_input_display(payload) if payload else "Record input")
+                    record_entry.config(state="readonly")
+                    record_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                    close_btn.pack(side=tk.LEFT, fill=tk.Y, padx=(int(2 * scaling_factor), 0))
+                if value == "Custom":
+                    self.root.after_idle(begin_custom_recording)
+            else:
+                selector.set(value)
+                selector.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        selector.set(settings.get("function", "Default"))
+        def _on_function_selected(_event):
+            set_function(selector.get())
+            # Auto-open the settings floating window for functions that have one.
+            # refresh_function (run inside set_function) packs action_btn and wires its
+            # popup command only for Default / In-App Gyro / Change Profile / Mouse Click;
+            # Mode Shift / Gyro Lock pack it as a label with a no-op command, and
+            # record/None don't pack it -- so invoking only when mapped opens exactly the
+            # functions that have a window. Deferred so the repack/realize finishes first.
+            self.root.after(50, lambda: action_btn.winfo_ismapped() and action_btn.invoke())
+        selector.bind("<<ComboboxSelected>>", _on_function_selected)
+        refresh_function(settings.get("function", "Default"))
+
+        threshold_cell = create_row("Activate Threshold:", int(8 * scaling_factor))
+        threshold = tk.Scale(threshold_cell, from_=1, to=3, resolution=1, orient=tk.HORIZONTAL,
+                             length=control_width, bg=background_color, fg=text_color,
+                             troughcolor=button_gray, activebackground=highlight_color,
+                             highlightthickness=0, bd=0, sliderrelief=tk.FLAT,
+                             sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor),
+                             font=control_font)
+        threshold.set(settings.get("activate_threshold", 1))
+        threshold.pack(side=tk.LEFT)
+        threshold.bind("<ButtonRelease-1>", lambda _event: (CONFIG.set_joycon_ir_sensor_setting_scoped(side, "activate_threshold", int(float(threshold.get())), profile_name, category, mapping_scope), CONFIG.save_config()))
+        finalize()
+        popup.update_idletasks()
+        self._place_popup_within_root_bounds(popup, anchor_widget)
+
+        self.root.after(100, self.bind_joystick_custom_popup_outside_click)
+
+    def open_joycon_ir_mouse_settings(self, side, anchor_widget, profile_name=None, category=None, mapping_scope=None):
+        profile_name = profile_name or CONFIG.active_profile
+        category = category or CONFIG.get_current_category()
+        existing = getattr(self, "joycon_ir_mouse_popup", None)
+        if existing is not None and existing.winfo_exists() and getattr(self, "joycon_ir_mouse_popup_anchor", None) is anchor_widget:
+            self.close_joycon_ir_mouse_popup()
+            return
+        self.close_joycon_ir_mouse_popup()
+        self._close_joycon_ir_switch_input_popup()
+        popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID,
+                         padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        self.joycon_ir_mouse_popup = popup
+        self.joycon_ir_mouse_popup_anchor = anchor_widget
+        popup.joycon_ir_context = (side, profile_name, category, mapping_scope)
+        settings = CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope)["ir_mouse"]
+
+        # Raw Input toggle, styled after the wired Pro Controller's "Auto Scan: On/Off".
+        # Packed into the popup itself (not the two-column content grid) and before
+        # _joycon_ir_popup_layout packs `content`, so it spans the popup's full width
+        # inside the existing padding and sits at the very top.
+        # "Raw Input" routes IR mouse motion through a WinUHid virtual HID mouse.
+        # It is available in MSIX only when a healthy external WinUHid exists.
+        if not utils.is_packaged() or packaged_winuhid_available():
+            raw_input_frame = tk.Frame(popup, bg=button_gray)
+            raw_input_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, int(8 * scaling_factor)))
+
+            def raw_input_enabled():
+                # Deliberately the unscoped getter: raw_input is one value per side that
+                # Mode Shift / In-app Gyro layers do not override, because toggling it
+                # creates or destroys a real virtual HID mouse device.
+                return bool(CONFIG.get_joycon_ir_sensor_settings(
+                    side, profile_name, category)["ir_mouse"].get("raw_input", False))
+
+            def refresh_raw_input_button():
+                raw_input_btn.config(text=f"Raw Input: {'On' if raw_input_enabled() else 'Off'}")
+
+            def toggle_raw_input():
+                CONFIG.set_joycon_ir_mouse_setting(side, "raw_input", not raw_input_enabled(),
+                                                   profile_name, category)
+                CONFIG.save_config()
+                refresh_raw_input_button()
+
+            raw_input_btn = tk.Button(
+                raw_input_frame,
+                text="",
+                bg=button_gray,
+                fg=text_color,
+                bd=0,
+                relief=tk.FLAT,
+                font=scale_font(("Arial", 11, "bold")),
+                command=toggle_raw_input,
+            )
+            raw_input_btn.pack(fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+            refresh_raw_input_button()
+            Tooltip(raw_input_btn, lambda: "Send IR Mouse movement through a virtual HID mouse\n"
+                                           "so games that read Raw Input can see it.")
+
+        create_row, finalize, control_font, control_width, _control_height = self._joycon_ir_popup_layout(popup)
+        sensitivity_cell = create_row("Sensitivity:")
+        sensitivity = tk.Scale(sensitivity_cell, from_=1, to=10, resolution=.2, orient=tk.HORIZONTAL,
+                               length=control_width, bg=background_color, fg=text_color,
+                               troughcolor=button_gray, activebackground=highlight_color,
+                               highlightthickness=0, bd=0, sliderrelief=tk.FLAT,
+                               sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor),
+                               font=control_font)
+        sensitivity.set(settings.get("sensitivity", 4.0))
+        sensitivity.pack(side=tk.LEFT)
+        sensitivity.bind("<ButtonRelease-1>", lambda _event: (CONFIG.set_joycon_ir_mouse_setting_scoped(side, "sensitivity", float(sensitivity.get()), profile_name, category, mapping_scope), CONFIG.save_config()))
+
+        def display_tokens(tokens):
+            return " | ".join(back_button_label(token) for token in tokens) if tokens else "None"
+
+        def create_ir_mouse_click_button(cell):
+            group = tk.Frame(cell, bg=background_color, width=control_width, height=_control_height)
+            group.pack(side=tk.LEFT)
+            group.pack_propagate(False)
+            button = tk.Button(
+                group,
+                bg=button_gray,
+                fg="white",
+                font=control_font,
+                relief=tk.FLAT,
+                bd=0,
+                activebackground=button_gray,
+                activeforeground="white",
+            )
+            button.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            return button
+
+        for key, title in (("left_click", "Mouse Left Click:"), ("right_click", "Mouse Right Click:"), ("middle_click", "Mouse Middle Click:")):
+            cell = create_row(title, int(8 * scaling_factor))
+            btn = create_ir_mouse_click_button(cell)
+            def select_token(tokens, setting_key=key, button=btn):
+                CONFIG.set_joycon_ir_mouse_setting_scoped(side, setting_key, tokens, profile_name, category, mapping_scope)
+                CONFIG.save_config()
+                button.config(text=display_tokens(tokens))
+            btn.config(text=display_tokens(settings.get(key, [])),
+                       command=lambda button=btn, setting_key=key: self._open_joycon_ir_switch_input_popup(
+                           button,
+                           CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope)["ir_mouse"].get(setting_key, []),
+                           lambda tokens, k=setting_key, b=button: select_token(tokens, k, b)))
+            Tooltip(btn, lambda k=key: display_tokens(CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope)["ir_mouse"].get(k, [])))
+        finalize()
+        popup.update_idletasks()
+        self._place_popup_within_root_bounds(popup, anchor_widget)
+
+        bind_id = getattr(self, "joycon_ir_mouse_popup_bind_id", None)
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except Exception:
+                pass
+
+        def close_if_outside_ir_mouse(event):
+            current = getattr(self, "joycon_ir_mouse_popup", None)
+            if current is None or not current.winfo_exists():
+                self.close_joycon_ir_mouse_popup()
+                return
+            if (self._event_in_widget(current, event)
+                    or self._event_in_widget(getattr(self, "joycon_ir_switch_input_popup", None), event)
+                    or self._event_in_widget(anchor_widget, event)):
+                return
+            self.close_joycon_ir_mouse_popup()
+
+        self.joycon_ir_mouse_popup_bind_id = self.root.bind("<ButtonPress>", close_if_outside_ir_mouse, add="+")
+
+    def close_joycon_ir_mouse_popup(self):
+        self._close_joycon_ir_switch_input_popup()
+        popup = getattr(self, "joycon_ir_mouse_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+        self.joycon_ir_mouse_popup = None
+        self.joycon_ir_mouse_popup_anchor = None
+        bind_id = getattr(self, "joycon_ir_mouse_popup_bind_id", None)
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except Exception:
+                pass
+        self.joycon_ir_mouse_popup_bind_id = None
 
     def on_gc_trigger_calib_clicked(self):
         gc_controller = None
@@ -7870,6 +11287,11 @@ bg_color=panel_bg, widths=[8, 10])
         GCTriggerCalibrationWizard(self.root, gc_controller)
 
     def update_driver_type_setting(self, val):
+        self.close_joystick_custom_popup()
+        # Redirect a saved/manual WinUHid selection only when the external driver
+        # is actually unavailable.  MSIX never installs it from inside the app.
+        if utils.is_packaged() and not packaged_winuhid_available() and val == "WinUHid":
+            val = "ViGEmBus"
         # 1. 霈??(Removed load_config to prevent async save race condition)
 
         old_driver = getattr(CONFIG, "driver_type", "WinUHid")
@@ -7890,33 +11312,64 @@ bg_color=panel_bg, widths=[8, 10])
                 return
         elif val == "USBIP":
             usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-            if not os.path.exists(usbip_exe):
+
+            def usbip_ready():
+                invalidate_driver_status_cache("usbip")
+                status = get_usbip_status()
+                return status.installed or (
+                    status.unknown and os.path.exists(usbip_exe)), status
+
+            ready, usbip_status = usbip_ready()
+            if not ready:
+                partial = usbip_status.state == USBIP_PARTIAL
                 answer = self.ask_centered_yes_no(
-                    "Install USBIP Driver",
-                    "The USBIP driver is required but is not installed.\n\n"
-                    "Do you want to install it now?\n(Requires administrator privileges and will temporarily reset USB connections.)"
+                    "Repair USBIP Driver" if partial else "Install USBIP Driver",
+                    (("USBIP is partially installed.\n\n" + usbip_status.describe() + "\n\n"
+                      "Do you want to clean it up and reinstall it now?\n")
+                     if partial else
+                     "The USBIP driver is required but is not installed.\n\n"
+                     "Do you want to install it now?\n") +
+                    "(Requires administrator privileges and will temporarily reset USB connections.)"
                 )
                 if answer:
+                    if partial and not self.run_usbip_uninstall():
+                        self.driver_switch.set_value(old_driver)
+                        return
                     self.run_usbip_install(show_success_msg=True)
-                    if not os.path.exists(usbip_exe):
+                    if not usbip_ready()[0]:
                         self.driver_switch.set_value(old_driver)
                         return
                 else:
                     self.driver_switch.set_value(old_driver)
                     return
         else:
-            if not is_driver_installed():
+            winuhid_status = get_winuhid_status()
+            if winuhid_status.unknown and verify_winuhid_runtime(attempts=2):
+                # State unreadable but the driver actually works - do not prompt.
+                logger.warning("WinUHid status undetermined: %s", winuhid_status.describe())
+                winuhid_status = None
+            if winuhid_status is not None and not winuhid_status.installed:
                 if getattr(CONFIG, 'driver_installed', False):
                     CONFIG.driver_installed = False
                     CONFIG.save_config()
                     self.update_driver_button()
                 answer = self.ask_centered_yes_no(
-                    "Install Virtual Controller Driver",
-                    "WinUHid driver is not installed on your system.\n\nDo you want to install it now?\n(Requires administrator privileges.)"
+                    "Repair Virtual Controller Driver" if winuhid_status.state == WINUHID_PARTIAL else "Install Virtual Controller Driver",
+                    (("WinUHid is partially installed.\n\n" + winuhid_status.describe() + "\n\n"
+                      "Do you want to clean up and reinstall it now?")
+                     if winuhid_status.state == WINUHID_PARTIAL else
+                     "WinUHid driver is not installed.\n\nDo you want to install it now?")
+                    + "\n(Requires administrator privileges.)"
                 )
                 if answer:
+                    if winuhid_status.state == WINUHID_PARTIAL and not self.run_driver_uninstall():
+                        self.driver_switch.set_value(old_driver)
+                        return
                     self.run_driver_install(show_success_msg=False)
-                    if not is_driver_installed():
+                    invalidate_driver_status_cache("winuhid")
+                    installed_now = get_winuhid_status()
+                    if not (installed_now.installed
+                            or (installed_now.unknown and verify_winuhid_runtime(attempts=2))):
                         self.driver_switch.set_value(old_driver)
                         return
                 else:
@@ -8028,6 +11481,9 @@ bg_color=panel_bg, widths=[8, 10])
             # 摮?
             CONFIG.save_config()
             
+        self.close_joystick_custom_popup()
+        self.close_in_app_gyro_popup()
+        self.refresh_joycon_ir_sensor_buttons()
         self._refresh_mapping_comboboxes()
         self.force_refresh_player_slots()
  
@@ -8039,8 +11495,11 @@ bg_color=panel_bg, widths=[8, 10])
             self._player_slot_refresh_pending = True
             return
         self._update_djg_panel_visibility()
-        if hasattr(self, 'djg_dominant_switch'):
-            self.djg_dominant_switch.set_value(getattr(CONFIG, "djg_dominant_side", "Left"))
+        if hasattr(self, 'djg_dominant_var'):
+            djg_dominant = getattr(CONFIG, "djg_dominant_side", "Right")
+            self.djg_dominant_var.set(djg_dominant)
+            if djg_dominant in ("Left", "Right") and hasattr(self, 'djg_dominant_switch'):
+                self.djg_dominant_switch.set_value(djg_dominant)
         if hasattr(self, 'current_controllers'):
             if getattr(self, 'players_info', None) is not None:
                 for p in self.players_info:
@@ -8290,6 +11749,7 @@ bg_color=panel_bg, widths=[8, 10])
         # No need to restart discovery, controllers can read the setting dynamically or on reconnect
 
     def update_sim_mode_setting(self, val):
+        self.close_joystick_custom_popup()
         # 1. 霈??(Removed load_config to prevent async save race condition)
         
         old_mode = getattr(CONFIG, "simulation_mode", "PS5")
@@ -8338,7 +11798,10 @@ bg_color=panel_bg, widths=[8, 10])
             # 摮?
             CONFIG.save_config()
             self.update_dynamic_rumble_mode_options()
-            
+
+        self.close_joystick_custom_popup()
+        self.close_in_app_gyro_popup()
+        self.refresh_joycon_ir_sensor_buttons()
         self._refresh_mapping_comboboxes()
         self.force_refresh_player_slots()
 
@@ -8385,23 +11848,57 @@ bg_color=panel_bg, widths=[8, 10])
             
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
-        
         current_rumble = getattr(CONFIG, "rumble_mode", "Xbox")
-        if current_rumble == "Switch":
-            current_rumble = "PS5" # Automatically migrate name in memory
-            CONFIG.rumble_mode = "PS5"
+        is_usbip_ps5 = driver_type == "USBIP" and sim_mode == "PS5"
+        allowed_values = ["Xbox", "PS5"] if is_usbip_ps5 else ["Xbox", "Switch"]
+
+        # Rumble values are persisted per Emu Mode category.  "PS5" is only a
+        # valid alias for USBIP PS5 audio/HD rumble; converting it globally used
+        # to corrupt the Xbox category when returning to Xbox One.  Recover old
+        # corrupted Xbox/WinUHid values by mapping PS5 back to Switch instead.
+        normalized_rumble = current_rumble
+        if is_usbip_ps5 and current_rumble == "Switch":
+            normalized_rumble = "PS5"
+        elif not is_usbip_ps5 and current_rumble == "PS5":
+            normalized_rumble = "Switch"
+        elif current_rumble not in allowed_values:
+            logger.warning(
+                "Unsupported rumble mode %r for driver=%s emu_mode=%s; using %s",
+                current_rumble, driver_type, sim_mode, allowed_values[0],
+            )
+            normalized_rumble = allowed_values[0]
+
+        if normalized_rumble != current_rumble:
+            logger.info(
+                "Normalized rumble mode %s -> %s for driver=%s emu_mode=%s",
+                current_rumble, normalized_rumble, driver_type, sim_mode,
+            )
+            CONFIG.rumble_mode = normalized_rumble
             CONFIG.save_config()
+        current_rumble = normalized_rumble
+
+        # These buttons occupy the same Rumble Mode position and are mutually
+        # exclusive by the active emulation transport.
+        if hasattr(self, 'audio_haptics_button'):
+            self.audio_haptics_button.pack_forget()
+        if hasattr(self, 'impulse_trigger_button'):
+            self.impulse_trigger_button.pack_forget()
             
-        if driver_type == "USBIP" and sim_mode == "PS5":
+        if is_usbip_ps5:
             self.rumble_mode_switch.update_options(["Xbox", "PS5 / HD Rumble"], ["Xbox", "PS5"], current_rumble, widths=[8, 16])
             self.audio_haptics_button.pack(side=tk.LEFT, after=self.rumble_mode_switch, padx=(int(10 * scaling_factor), 0))
-        else:
-            if current_rumble == "PS5":
-                current_rumble = "Switch"
-                CONFIG.rumble_mode = "Switch"
-                CONFIG.save_config()
+        elif driver_type == "WinUHid" and sim_mode == "Xbox One":
             self.rumble_mode_switch.update_options(["Xbox", "Switch"], ["Xbox", "Switch"], current_rumble)
-            self.audio_haptics_button.pack_forget()
+            self.impulse_trigger_button.pack(side=tk.LEFT, after=self.rumble_mode_switch, padx=(int(10 * scaling_factor), 0))
+        else:
+            self.rumble_mode_switch.update_options(["Xbox", "Switch"], ["Xbox", "Switch"], current_rumble)
+
+        if hasattr(self, 'vibration_frequency_label') and hasattr(self, 'vibration_frequency_scale'):
+            self.update_rumble_mode_ui(current_rumble)
+        if hasattr(self, 'vibration_strength_scale'):
+            self.vibration_strength_scale.set(CONFIG.vibration_strength)
+        if hasattr(self, 'vibration_frequency_scale'):
+            self.vibration_frequency_scale.set(CONFIG.vibration_frequency)
 
     def update_rumble_mode_ui(self, mode):
         if mode in ["Switch", "PS5"]:
@@ -8445,22 +11942,36 @@ bg_color=panel_bg, widths=[8, 10])
     def poll_wired_device_events(self):
         if getattr(self, 'is_quitting', False):
             return
-        latest = None
+        # Keep the latest of each kind: the queue now carries wired-controller events and
+        # Bluetooth-radio events, and collapsing to a single "latest" would let one kind
+        # swallow the other.
+        latest = {}
         try:
             q = getattr(self, "wired_device_event_queue", None)
             if q is not None:
                 while True:
                     try:
-                        latest = q.get_nowait()
+                        event = q.get_nowait()
                     except queue.Empty:
                         break
+                    latest[event.get("kind", "wired")] = event
         except Exception:
-            latest = None
-        if latest:
+            latest = {}
+
+        wired_event = latest.get("wired")
+        if wired_event:
             self._schedule_wired_device_change_rescan(
-                latest.get("reason", "device_arrival"),
-                latest.get("path"),
+                wired_event.get("reason", "device_arrival"),
+                wired_event.get("path"),
             )
+
+        if latest.get("bluetooth_radio"):
+            try:
+                from discoverer import notify_bluetooth_radio_changed
+                notify_bluetooth_radio_changed()
+            except Exception:
+                logger.debug("Bluetooth radio change notification failed", exc_info=True)
+
         try:
             self.root.after(250, self.poll_wired_device_events)
         except Exception:
@@ -8519,25 +12030,15 @@ bg_color=panel_bg, widths=[8, 10])
         self.wired_pro_settings_popup = popup
         self.wired_pro_settings_popup_anchor = anchor_widget
 
-        def read_hidhide_installed():
-            try:
-                import hidhide
-                return hidhide.is_available()
-            except Exception:
-                return False
-
         def refresh_hidhide_button():
-            installed = read_hidhide_installed()
-            self._hidhide_installed_cached = installed
-            CONFIG.hidhide_installed = installed
-            CONFIG.save_config()
+            installed = self._sync_hidhide_installed()
             hidhide_btn.config(text="HidHide" if installed else "Install HidHide")
 
         hidhide_frame = tk.Frame(popup, bg=button_gray)
         hidhide_frame.pack(fill=tk.X)
         hidhide_btn = tk.Button(
             hidhide_frame,
-            text="HidHide" if read_hidhide_installed() else "Install HidHide",
+            text="HidHide" if hidhide_service_state() is True else "Install HidHide",
             bg=button_gray,
             fg=text_color,
             bd=0,
@@ -8600,44 +12101,123 @@ bg_color=panel_bg, widths=[8, 10])
         self._place_popup_within_root_bounds(popup, anchor_widget, position_adjust=(2, -2))
         self.root.after(100, self.bind_wired_pro_controller_settings_popup_outside_click)
 
+    def _sync_hidhide_installed(self, save=True):
+        """Refresh the cached and persisted HidHide flag without guessing.
+
+        Returns the effective installed flag. An undeterminable state keeps the
+        previous answer rather than persisting a wrong False.
+        """
+        state = hidhide_service_state()
+        if state is None:
+            logger.warning("HidHide state undetermined; keeping the previous value.")
+            return bool(getattr(CONFIG, "hidhide_installed", False))
+        self._hidhide_installed_cached = state
+        CONFIG.hidhide_installed = state
+        if save:
+            CONFIG.save_config()
+        return state
+
     def on_hidhide_button(self):
-        try:
-            import hidhide
-            installed = hidhide.is_available()
-        except Exception:
-            installed = False
+        installed = hidhide_service_state() is True
         if installed:
             if self.ask_centered_yes_no("Uninstall HidHide", "Uninstall the HidHide driver?\n(Requires administrator privileges.)"):
                 self.run_hidhide_uninstall()
         else:
             if self.ask_centered_yes_no(
                 "Install HidHide",
-                "A wired Pro Controller 2 was detected.\n\nHidHide hides the physical "
-                "controller's HID so games only see the virtual controller. Install it "
-                "now?\n(Requires administrator privileges.)",
+                f"{self.wired_controller_label(sentence=True)} detected.\n\nHidHide "
+                "hides the physical controller's HID so games only see the virtual "
+                "controller. Install it now?\n(Requires administrator privileges.)",
             ):
                 self.run_hidhide_install()
+
+    def ask_hidhide_auto_install(self):
+        """Show the automatic HidHide prompt with a persistent opt-out checkbox."""
+        dialog_w = int(520 * scaling_factor)
+        dialog_h = int(260 * scaling_factor)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Install HidHide")
+        dialog.resizable(False, False)
+        dialog.config(bg="#1E1E1E")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self.center_window_on_root(dialog, dialog_w, dialog_h)
+
+        result = {"install": False}
+        suppress_var = tk.BooleanVar(value=False)
+
+        tk.Label(
+            dialog,
+            text=(
+                f"{self.wired_controller_label(sentence=True)} detected.\n\n"
+                "HidHide hides the controller's physical HID so games only see "
+                "the virtual controller (no double input).\n\n"
+                "Install it now?\n(Requires administrator privileges.)"
+            ),
+            fg="white",
+            bg="#1E1E1E",
+            font=scale_font(("Arial", 11, "bold")),
+            justify=tk.CENTER,
+            wraplength=int(460 * scaling_factor),
+        ).pack(padx=int(24 * scaling_factor), pady=(int(22 * scaling_factor), int(10 * scaling_factor)))
+
+        tk.Checkbutton(
+            dialog,
+            text="Do not show again",
+            variable=suppress_var,
+            bg="#1E1E1E",
+            fg="white",
+            activebackground="#1E1E1E",
+            activeforeground="white",
+            selectcolor=button_gray,
+            font=scale_font(("Arial", 10)),
+        ).pack(pady=(0, int(12 * scaling_factor)))
+
+        button_frame = tk.Frame(dialog, bg="#1E1E1E")
+        button_frame.pack(pady=(0, int(18 * scaling_factor)))
+
+        def close(install):
+            result["install"] = bool(install)
+            if suppress_var.get():
+                CONFIG.hidhide_install_prompt_suppressed = True
+                CONFIG.save_config()
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        for text, install in (("Yes", True), ("No", False)):
+            frame = tk.Frame(button_frame, bg=button_gray)
+            frame.pack(side=tk.LEFT, padx=int(6 * scaling_factor))
+            tk.Button(
+                frame,
+                text=text,
+                bg=button_gray,
+                fg=text_color,
+                bd=0,
+                relief=tk.FLAT,
+                font=scale_font(("Arial", 10, "bold")),
+                width=8,
+                command=lambda value=install: close(value),
+            ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        self.root.wait_window(dialog)
+        return result["install"]
+
 
     def on_wired_usb_driver_button(self):
         # WinUSB is auto-installed by the controller's MS OS descriptor, so the only
         # optional driver here is HidHide. If it's not installed, prompt to install it
         # directly (a centered notification). If it is installed, open a small options
         # window to enable/disable filtering or uninstall.
-        try:
-            import hidhide
-            hidhide_installed = hidhide.is_available()
-        except Exception:
-            hidhide_installed = False
-
-        self._hidhide_installed_cached = hidhide_installed
-        CONFIG.hidhide_installed = hidhide_installed
-        CONFIG.save_config()
+        hidhide_installed = self._sync_hidhide_installed()
         self.update_driver_buttons_visibility()
 
         if not hidhide_installed:
             if self.ask_centered_yes_no(
                 "Install HidHide",
-                "A wired Pro Controller 2 was detected.\n\n"
                 "HidHide hides the controller's physical HID so games only see the virtual "
                 "controller (no double input). Install it now?\n"
                 "(Optional. Requires administrator privileges.)",
@@ -8647,6 +12227,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         # HidHide installed → options window (enable/disable filtering, uninstall).
         try:
+            import hidhide
             hidhide_active = hidhide.is_active()
         except Exception:
             hidhide_active = False
@@ -8695,16 +12276,12 @@ bg_color=panel_bg, widths=[8, 10])
 
         def recheck_and_refresh():
             nonlocal hidhide_installed, hidhide_active
+            hidhide_installed = self._sync_hidhide_installed()
             try:
                 import hidhide
-                hidhide_installed = hidhide.is_available()
                 hidhide_active = hidhide.is_active() if hidhide_installed else False
             except Exception:
-                hidhide_installed = False
                 hidhide_active = False
-            self._hidhide_installed_cached = hidhide_installed
-            CONFIG.hidhide_installed = hidhide_installed
-            CONFIG.save_config()
             self.update_driver_buttons_visibility()
             if not hidhide_installed and dialog.winfo_exists():
                 dialog.destroy()
@@ -8730,7 +12307,7 @@ bg_color=panel_bg, widths=[8, 10])
             # Capture the intended target once, from the current live driver state.
             try:
                 import hidhide
-                if not hidhide.is_available():
+                if hidhide_service_state() is not True:
                     unlock_and_refresh()
                     return
                 target_active = not hidhide.is_active()
@@ -8813,24 +12390,24 @@ bg_color=panel_bg, widths=[8, 10])
     def _hide_detected_pro2_with_hidhide(self):
         try:
             import hidhide
-            from usb_hid_controller import enumerate_pro_controller2
-            for entry in enumerate_pro_controller2(reason="hidhide_action"):
+            from usb_hid_controller import enumerate_wired_controllers
+            for entry in enumerate_wired_controllers(reason="hidhide_action"):
                 instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
                 if instance_id:
                     hidhide.hide_device(instance_id)
         except Exception as e:
-            logger.debug("Failed to add detected Pro Controller 2 to HidHide: %s", e)
+            logger.debug("Failed to add detected wired controller to HidHide: %s", e)
 
     def _unhide_detected_pro2_with_hidhide(self):
         try:
             import hidhide
-            from usb_hid_controller import enumerate_pro_controller2
-            for entry in enumerate_pro_controller2(reason="hidhide_action"):
+            from usb_hid_controller import enumerate_wired_controllers
+            for entry in enumerate_wired_controllers(reason="hidhide_action"):
                 instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
                 if instance_id:
                     hidhide.unhide_device(instance_id)
         except Exception as e:
-            logger.debug("Failed to remove detected Pro Controller 2 from HidHide: %s", e)
+            logger.debug("Failed to remove detected wired controller from HidHide: %s", e)
 
     def _run_hidhide_script(self, script_name, wait_text):
         """Run a bundled HidHide install/uninstall PowerShell script elevated (runas),
@@ -8851,32 +12428,13 @@ bg_color=panel_bg, widths=[8, 10])
             tk.Label(progress_win, text=wait_text, fg="white", bg="#1E1E1E",
                      font=scale_font(("Arial", 11, "bold"))).pack(pady=int(40 * scaling_factor))
 
-            info = SHELLEXECUTEINFOW()
-            info.cbSize = ctypes.sizeof(info)
-            info.fMask = SEE_MASK_NOCLOSEPROCESS
-            info.hwnd = self.get_root_hwnd()
-            info.lpVerb = "runas"
-            info.lpFile = "powershell.exe"
-            info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{ps1}"'
-            info.lpDirectory = None
-            info.nShow = 1
-
-            # Grant foreground rights + release the modal grab so the UAC consent prompt
-            # comes to the front instead of only flashing in the taskbar.
-            try:
-                progress_win.grab_release()
-                self.root.focus_force()
-                ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
-            except Exception:
-                pass
-
-            if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+            hProcess = self._launch_elevated(
+                "powershell.exe", self._ps_hidden_args(ps1), progress_win=progress_win)
+            if not hProcess:
                 progress_win.grab_release()
                 progress_win.destroy()
                 self.show_centered_message("Error", "HidHide operation was cancelled (UAC prompt declined).")
                 return None
-
-            hProcess = info.hProcess
 
             def check_process():
                 if hProcess and ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0) == WAIT_TIMEOUT:
@@ -8897,21 +12455,19 @@ bg_color=panel_bg, widths=[8, 10])
         return exit_code[0]
 
     def run_hidhide_install(self, prompt_restart=True):
+        # Install HidHide from the bundled installer script (both builds); nothing downloaded.
         code = self._run_hidhide_script("install_hidhide.ps1", "Installing HidHide...\nPlease authorize the UAC prompt if asked.")
         if code is None:
             return False  # cancelled / could not start
-        try:
-            import hidhide
-            ok = hidhide.is_available()
-        except Exception:
-            ok = False
-        CONFIG.hidhide_installed = ok
-        CONFIG.save_config()
-        self._hidhide_installed_cached = ok
+        ok = self._sync_hidhide_installed()
         self.update_driver_buttons_visibility()
 
         if code not in (0, 3010) and not ok:
-            self.show_centered_message("Error", "HidHide installation did not complete.")
+            invalidate_driver_status_cache("hidhide")
+            self.show_centered_message(
+                "Error",
+                "HidHide installation did not complete.\n\n"
+                f"Exit code: {code}\n{get_hidhide_status().describe()}")
             return False
 
         # Centered success notification (on the main window).
@@ -8932,22 +12488,35 @@ bg_color=panel_bg, widths=[8, 10])
         return bool(ok or code in (0, 3010))
 
     def run_hidhide_uninstall(self):
+        # Uninstall from the bundled script (both builds); nothing downloaded.
         code = self._run_hidhide_script("uninstall_hidhide.ps1", "Uninstalling HidHide...\nPlease authorize the UAC prompt if asked.")
         if code is None:
             return  # cancelled / could not start
-        try:
-            import hidhide
-            still = hidhide.is_available()
-        except Exception:
-            still = False
-        CONFIG.hidhide_installed = still
-        CONFIG.save_config()
-        self._hidhide_installed_cached = still
+        # An undeterminable state must not read as "removed" here, so require a
+        # definite False before declaring the service gone.
+        still = hidhide_service_state() is not False
+        self._sync_hidhide_installed()
         self.update_driver_buttons_visibility()
 
-        # HidHide's kernel driver stays loaded until the next boot, so the removal only
-        # finishes after a restart (is_available() is still True right now). Report this
-        # accurately and offer to restart, mirroring the install flow.
+        if code not in (0, 3010) or still:
+            log_path = os.path.join(
+                os.environ.get("TEMP", ""), "Switch2Connect_HidHide_uninstall.log")
+            try:
+                with open(log_path, "r", encoding="utf-8-sig", errors="replace") as stream:
+                    details = stream.read().strip().splitlines()[-12:]
+                detail_text = "\n\n" + "\n".join(details) if details else ""
+            except OSError:
+                detail_text = ""
+            self.show_centered_message(
+                "Error",
+                "HidHide uninstallation failed or left the driver service installed."
+                f"\n\nExit code: {code}{detail_text}",
+            )
+            return False
+
+        # The service and package are gone, but the loaded driver file may remain
+        # pending removal until reboot. Report the pending restart without restoring
+        # the Installed state in the UI.
         self.show_centered_message(
             "Success",
             "HidHide removal started. A restart is required to complete the uninstall.",
@@ -8961,6 +12530,7 @@ bg_color=panel_bg, widths=[8, 10])
                 subprocess.Popen(["shutdown", "/r", "/t", "0"])
             except Exception as e:
                 self.show_centered_message("Error", f"Could not restart automatically: {e}\nPlease restart manually.")
+        return True
 
     def custom_askstring(self, title, prompt, initialvalue=""):
         dialog = tk.Toplevel(self.root)
@@ -9002,7 +12572,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.root.wait_window(dialog)
         return result[0]
 
-    def custom_messagebox(self, title, message, type="info"):
+    def custom_messagebox(self, title, message, type="info", confirm_text="Yes", cancel_text="No"):
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
         dialog.configure(bg=background_color)
@@ -9026,8 +12596,8 @@ bg_color=panel_bg, widths=[8, 10])
             dialog.destroy()
             
         if type == "yesno":
-            tk.Button(btn_frame, text="Yes", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack(side=tk.LEFT, padx=5)
-            tk.Button(btn_frame, text="No", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(False)).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text=confirm_text, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text=cancel_text, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(False)).pack(side=tk.LEFT, padx=5)
         else:
             tk.Button(btn_frame, text="OK", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack()
             
@@ -9067,7 +12637,7 @@ bg_color=panel_bg, widths=[8, 10])
 
     def set_profile_assigned_apps(self, profile_name, apps):
         if profile_name not in CONFIG.profiles:
-            return
+            return True
         normalized_seen = set()
         normalized_apps = []
         for app in apps:
@@ -9366,6 +12936,9 @@ bg_color=panel_bg, widths=[8, 10])
                 self.apply_profile_switch()
             finally:
                 self.app_profile_switching = False
+            self.close_joystick_custom_popup()
+            self.close_in_app_gyro_popup()
+            self.refresh_joycon_ir_sensor_buttons()
             # Close the popup last, after the UI has been updated, and without forcing
             # an intermediate repaint of it. Refreshing/painting the popup right before
             # destroying it (and closing before the main UI updated) caused the brief
@@ -9394,22 +12967,23 @@ bg_color=panel_bg, widths=[8, 10])
             except Exception:
                 pass
 
-    def get_sorted_profiles(self):
+    def _profile_sort_key(self, s):
         import re
-        def sort_key(s):
-            tokens = re.findall(r'[a-zA-Z]+|\d+|[^a-zA-Z\d]+', s)
-            key = []
-            for t in tokens:
-                if t.isalpha():
-                    key.append((0, t.lower()))
-                elif t.isdigit():
-                    key.append((1, int(t)))
-                else:
-                    key.append((2, t))
-            return key
+        tokens = re.findall(r'[a-zA-Z]+|\d+|[^a-zA-Z\d]+', s)
+        key = []
+        for t in tokens:
+            if t.isalpha():
+                key.append((0, t.lower()))
+            elif t.isdigit():
+                key.append((1, int(t)))
+            else:
+                key.append((2, t))
+        return key
+
+    def get_sorted_profiles(self):
         return sorted(
             list(CONFIG.profiles.keys()),
-            key=lambda name: (0 if CONFIG.profiles.get(name, {}).get("change_profile_list", False) else 1, sort_key(name))
+            key=lambda name: (0 if CONFIG.profiles.get(name, {}).get("change_profile_list", False) else 1, self._profile_sort_key(name))
         )
 
     def _change_list_profiles(self):
@@ -9548,6 +13122,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.pending_profile = None
 
     def apply_profile_switch(self):
+        self.close_joystick_custom_popup()
         new_profile_name = getattr(CONFIG, 'active_profile', "")
         if not new_profile_name or new_profile_name not in CONFIG.profiles:
             return
@@ -9556,6 +13131,10 @@ bg_color=panel_bg, widths=[8, 10])
         if not new_driver:
             new_driver = getattr(CONFIG, "driver_type", "WinUHid")
             CONFIG.profiles[new_profile_name]["driver_type"] = new_driver
+        # A WinUHid profile maps to ViGEmBus only when MSIX cannot observe an
+        # externally installed healthy WinUHid stack.
+        if utils.is_packaged() and not packaged_winuhid_available() and new_driver == "WinUHid":
+            new_driver = "ViGEmBus"
             
         new_emu = CONFIG.profiles[new_profile_name].get("simulation_mode")
         if not new_emu:
@@ -9643,6 +13222,240 @@ bg_color=panel_bg, widths=[8, 10])
                 if callable(refresh_popup_rows) and getattr(self, "profile_popup", None) is not None and self.profile_popup.winfo_exists():
                     refresh_popup_rows()
                 
+    def _unique_profile_name(self, existing, name):
+        """Return ``name``, or ``name (2)`` / ``name (3)`` ... when it is taken."""
+        if name not in existing:
+            return name
+        index = 2
+        while f"{name} ({index})" in existing:
+            index += 1
+        return f"{name} ({index})"
+
+    def _normalize_imported_profile(self, profile_data):
+        """Fill an imported profile out to the canonical profile shape."""
+        import copy
+        normalized = CONFIG.get_default_profile_dict()
+        if isinstance(profile_data, dict):
+            normalized.update(copy.deepcopy(profile_data))
+        if not isinstance(normalized.get("assigned_apps"), list):
+            normalized["assigned_apps"] = []
+        normalized["change_profile_list"] = bool(normalized.get("change_profile_list", False))
+        if not isinstance(normalized.get("profile_switching_combo"), str):
+            normalized["profile_switching_combo"] = ""
+        normalized.pop("assigned_app", None)
+        return normalized
+
+    def _dedupe_assigned_apps(self, profiles, priority_names):
+        """An exe may only be assigned to one profile; ``priority_names`` win."""
+        seen = set()
+        ordered = list(priority_names) + [n for n in profiles if n not in priority_names]
+        for profile_name in ordered:
+            profile_data = profiles.get(profile_name)
+            if not isinstance(profile_data, dict):
+                continue
+            kept = []
+            for app in profile_data.get("assigned_apps") or []:
+                app_path = app.get("path") if isinstance(app, dict) else str(app)
+                normalized_path = normalize_app_path(app_path)
+                if not normalized_path or normalized_path in seen:
+                    continue
+                seen.add(normalized_path)
+                kept.append({
+                    "path": os.path.normpath(app_path),
+                    "name": (app.get("name") if isinstance(app, dict) else None) or get_exe_display_name(app_path),
+                })
+            profile_data["assigned_apps"] = kept
+
+    def _write_config_yaml(self, updates):
+        """Merge ``updates`` into config.yaml on disk under the Config save lock."""
+        with CONFIG._save_lock:
+            data = {}
+            if os.path.exists(CONFIG.config_file_path):
+                try:
+                    with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f:
+                        data = yaml.load(f, Loader=_YamlLoader) or {}
+                except Exception:
+                    data = {}
+            data.update(updates)
+            with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, Dumper=_YamlDumper, default_flow_style=False)
+
+    def on_import_profiles(self):
+        # The foreground-app poller must not fire a profile switch while a modal
+        # file dialog owns the foreground window (same guard as choose_app_path).
+        self.app_profile_poll_suspended = True
+        try:
+            file_path = filedialog.askopenfilename(
+                parent=self.root,
+                title="Choose a .yaml File",
+                filetypes=[("YAML files", "*.yaml")],
+            )
+        finally:
+            self.app_profile_poll_suspended = False
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                imported = yaml.load(f, Loader=_YamlLoader)
+        except Exception as e:
+            self.custom_messagebox("Import", f"Failed to read the file:\n{e}", type="error")
+            return
+
+        if not isinstance(imported, dict):
+            self.custom_messagebox("Import", "This file is not a valid config file.", type="error")
+            return
+        imported_profiles = imported.get("profiles")
+        if not isinstance(imported_profiles, dict):
+            imported_profiles = {}
+        file_has_controller_data = has_controller_related_data(imported)
+        if not imported_profiles and not file_has_controller_data:
+            self.custom_messagebox("Import", "This file contains nothing to import.", type="error")
+            return
+
+        names = sorted(imported_profiles.keys(), key=self._profile_sort_key)
+        selected, keep_current, include_calibration = self._open_profile_checklist_dialog(
+            "Choose Profiles to Import", names, "Import", show_keep_current=True,
+            show_calibration=file_has_controller_data,
+            calibration_confirm_message="Warning: Current controller related data will be replaced.",
+        )
+        if selected is None:
+            return
+        if not selected:
+            # Nothing to import into the profile store - never drop the local profiles.
+            keep_current = True
+
+        # Remember the current driver/emu mode on the active profile before the
+        # profile store is rewritten, exactly like on_add_profile does.
+        if CONFIG.active_profile in CONFIG.profiles:
+            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
+
+        import copy
+        merged = copy.deepcopy(CONFIG.profiles) if keep_current else {}
+        imported_names = []
+        for name in selected:
+            target_name = self._unique_profile_name(merged, name) if keep_current else name
+            merged[target_name] = self._normalize_imported_profile(imported_profiles.get(name))
+            imported_names.append(target_name)
+
+        self._dedupe_assigned_apps(merged, imported_names)
+
+        # Keep using the current profile; only fall back when it no longer exists.
+        active = CONFIG.active_profile if CONFIG.active_profile in merged else next(iter(merged))
+
+        if selected:
+            updates = {
+                key: value for key, value in imported.items()
+                if key not in ("profiles", "active_profile") and key not in MACHINE_LOCAL_CONFIG_KEYS
+            }
+            # The profile switching combo trigger only gets overwritten by a real
+            # input: an unset value in the imported file must not clear a local one.
+            if not str(updates.get("profile_switching_combo_trigger") or "").strip():
+                updates.pop("profile_switching_combo_trigger", None)
+            if not include_calibration:
+                # Scrub only what is coming in: dropping these keys from ``updates``
+                # leaves the local values in config.yaml untouched, and only the newly
+                # imported profiles are cleaned so kept profiles keep their entries.
+                strip_controller_related(updates)
+                for name in imported_names:
+                    strip_controller_related_from_profile(merged[name])
+            updates["profiles"] = merged
+            updates["active_profile"] = active
+        else:
+            # Controller related data only - leave the profile store and every other
+            # setting exactly as they are.
+            updates = {
+                key: imported[key] for key in CONTROLLER_RELATED_CONFIG_KEYS
+                if key in imported and key not in MACHINE_LOCAL_CONFIG_KEYS
+            }
+
+        try:
+            self._write_config_yaml(updates)
+        except Exception as e:
+            self.custom_messagebox("Import", f"Failed to write the config file:\n{e}", type="error")
+            return
+
+        CONFIG.load_config()
+        self._set_profile_button_text()
+        self.apply_profile_switch()
+        self.refresh_assigned_apps_ui()
+        self.refresh_profile_switching_combo_trigger_ui()
+        refresh_popup_rows = getattr(self, "refresh_profile_popup_rows", None)
+        if callable(refresh_popup_rows) and getattr(self, "profile_popup", None) is not None and self.profile_popup.winfo_exists():
+            refresh_popup_rows()
+        # Re-save so a save queued before the import cannot land on top of it.
+        CONFIG.save_config()
+        summary = f"Imported {len(imported_names)} profile(s)."
+        if include_calibration:
+            summary = (
+                "Imported controller related data."
+                if not imported_names else summary + "\nController related data imported."
+            )
+        self.custom_messagebox("Import", summary, type="info")
+
+    def on_export_profiles(self):
+        live_snapshot = {key: getattr(CONFIG, key, None) for key in CONTROLLER_RELATED_PRESENCE_KEYS}
+        live_snapshot["profiles"] = CONFIG.profiles
+        selected, _, include_calibration = self._open_profile_checklist_dialog(
+            "Choose Profiles to Export", self.get_sorted_profiles(), "Export",
+            show_calibration=has_controller_related_data(live_snapshot),
+        )
+        if selected is None:
+            return
+
+        self.app_profile_poll_suspended = True
+        try:
+            file_path = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Choose Export Location",
+                defaultextension=".yaml",
+                filetypes=[("YAML files", "*.yaml")],
+                initialfile="switch2_profiles.yaml" if selected else "switch2_controller_data.yaml",
+            )
+        finally:
+            self.app_profile_poll_suspended = False
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".yaml"):
+            file_path = os.path.splitext(file_path)[0] + ".yaml"
+
+        import copy
+        try:
+            with CONFIG._save_lock:
+                data = {}
+                if os.path.exists(CONFIG.config_file_path):
+                    with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f:
+                        data = yaml.load(f, Loader=_YamlLoader) or {}
+                if selected:
+                    # The in-memory profile store is authoritative (saves are async).
+                    data["profiles"] = {
+                        name: copy.deepcopy(CONFIG.profiles[name])
+                        for name in selected if name in CONFIG.profiles
+                    }
+                    if not include_calibration:
+                        strip_controller_related(data)
+                    if CONFIG.active_profile in data["profiles"]:
+                        data["active_profile"] = CONFIG.active_profile
+                    else:
+                        data["active_profile"] = next(iter(data["profiles"]), CONFIG.active_profile)
+                else:
+                    # Controller related data only - no profiles, no other settings.
+                    data = {
+                        key: value for key, value in data.items()
+                        if key in CONTROLLER_RELATED_CONFIG_KEYS
+                    }
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(data, f, Dumper=_YamlDumper, default_flow_style=False)
+        except Exception as e:
+            self.custom_messagebox("Export", f"Failed to export:\n{e}", type="error")
+            return
+
+        summary = f"Exported {len(selected)} profile(s)." if selected else "Exported controller related data."
+        if selected and include_calibration:
+            summary += "\nController related data included."
+        self.custom_messagebox("Export", summary, type="info")
+
     def on_delete_profile(self):
         if len(CONFIG.profiles) <= 1:
             self.custom_messagebox("Delete Profile", "Cannot delete the last profile.", type="warning")
@@ -9740,9 +13553,11 @@ bg_color=panel_bg, widths=[8, 10])
                 self.djg_enabled_switch.set_value(djg_enabled)
                 self.update_djg_enabled_setting(djg_enabled)
 
-            if hasattr(self, 'djg_dominant_switch'):
-                djg_dominant = getattr(CONFIG, "djg_dominant_side", "Left")
-                self.djg_dominant_switch.set_value(djg_dominant)
+            if hasattr(self, 'djg_dominant_var'):
+                djg_dominant = getattr(CONFIG, "djg_dominant_side", "Right")
+                self.djg_dominant_var.set(djg_dominant)
+                if djg_dominant in ("Left", "Right") and hasattr(self, 'djg_dominant_switch'):
+                    self.djg_dominant_switch.set_value(djg_dominant)
                 self.update_djg_dominant_setting(djg_dominant)
 
             if hasattr(self, 'djg_mode_combo'):
@@ -9817,19 +13632,39 @@ bg_color=panel_bg, widths=[8, 10])
             self.main_frame = tk.Frame(self.root, bg=background_color); self.main_frame.pack(pady=(10, 5), fill=tk.Y)
             self.players_info = None
         self.current_controllers = controllers_info
-        self.wired_pro2_detected = any(
-            controller is not None and (
-                controller.__class__.__name__ == "USBHidController"
-                or getattr(controller, "_hidhide_instance_id", None)
-            )
-            for vc in controllers_info or []
-            if vc is not None
-            for controller in getattr(vc, "controllers", []) or []
-        )
+        # This is the fast path -- it runs the moment a pad connects, ahead of the
+        # background WinUSB poll -- so the wired PIDs are collected here too, or every
+        # wired label would keep the previous controller's name until that poll lands.
+        detected = False
+        wired_pids = set()
+        for vc in controllers_info or []:
+            if vc is None:
+                continue
+            for controller in getattr(vc, "controllers", []) or []:
+                if controller is None:
+                    continue
+                is_usb_hid = controller.__class__.__name__ == "USBHidController"
+                if is_usb_hid or getattr(controller, "_hidhide_instance_id", None):
+                    detected = True
+                if is_usb_hid:
+                    wired_pids.add(getattr(controller, "usb_product_id", PRO_CONTROLLER2_PID))
+        self.wired_pro2_detected = detected
+        self.wired_controller_pids = sorted(wired_pids)
         self.update_driver_buttons_visibility()
+        # Refresh the header here too. In wired-only mode it reads wired_pro2_detected, and
+        # its other callers are the button-layout rebuild and the 5 s ESP32 status poll --
+        # neither of which fires when a wired pad connects, so the status would otherwise sit
+        # on "Pending USB Connection" for up to 5 seconds after the controller is ready.
+        try:
+            self.update_header_status()
+        except Exception:
+            logger.debug("Header status refresh failed", exc_info=True)
         
-        if hasattr(self, 'djg_dominant_switch'):
-            self.djg_dominant_switch.set_value(getattr(CONFIG, "djg_dominant_side", "Left"))
+        if hasattr(self, 'djg_dominant_var'):
+            djg_dominant = getattr(CONFIG, "djg_dominant_side", "Right")
+            self.djg_dominant_var.set(djg_dominant)
+            if djg_dominant in ("Left", "Right") and hasattr(self, 'djg_dominant_switch'):
+                self.djg_dominant_switch.set_value(djg_dominant)
         
         # Check if the driver type has been changed/fallback under the hood
         active_driver = getattr(CONFIG, "driver_type", "WinUHid")
@@ -9902,11 +13737,12 @@ bg_color=panel_bg, widths=[8, 10])
             img = Image.new('RGB', (64, 64), color=(0, 195, 227)) # Cyan fallback
         
         menu = (item('Show', self.show_window, default=True), item('Exit', lambda: self.root.after(0, self.on_quit)))
-        self.tray_icon = pystray.Icon("Switch2Controllers", img, "Switch2 Controllers", menu, action=self.show_window)
+        self.tray_icon = pystray.Icon("Switch2Connect", img, "Switch 2 Connect", menu, action=self.show_window)
         self.tray_icon.run_detached()
 
     def on_quit(self):
         if getattr(self, 'is_cleaning_up', False): return
+        self._close_kofi_window()
         try:
             if getattr(self, "wired_device_listener", None):
                 self.wired_device_listener.stop()
@@ -10084,62 +13920,55 @@ bg_color=panel_bg, widths=[8, 10])
             self.root.after(5000, self.start_esp32s3_refresh_timer)
 
     def refresh_wired_pro2_status_async(self):
-        """Poll for a wired Pro Controller 2, then update the HidHide button. WinUSB is
-        auto-installed by the controller (MS OS descriptor), so it isn't managed here —
-        we only keep an internal check as a safety-net warning. When a pad is present and
-        HidHide is absent, prompt to install HidHide once per session."""
+        """Poll for a wired controller, then update the HidHide button.
+
+        WinUSB is not checked or managed by the GUI: the USB transport selects it
+        automatically when available and falls back to HID otherwise. When a pad is
+        present and HidHide is absent, prompt to install HidHide once per session."""
         if getattr(self, '_wired_pro2_refresh_running', False) or getattr(self, 'is_quitting', False):
             return
         self._wired_pro2_refresh_running = True
 
         def worker():
-            detected = any(
-                controller is not None and (
-                    controller.__class__.__name__ == "USBHidController"
-                    or getattr(controller, "_hidhide_instance_id", None)
-                )
-                for vc in getattr(self, "current_controllers", []) or []
-                if vc is not None
-                for controller in getattr(vc, "controllers", []) or []
-            )
+            wired_pids = set()
+            detected = False
+            for vc in getattr(self, "current_controllers", []) or []:
+                if vc is None:
+                    continue
+                for controller in getattr(vc, "controllers", []) or []:
+                    if controller is None:
+                        continue
+                    is_usb_hid = controller.__class__.__name__ == "USBHidController"
+                    if is_usb_hid or getattr(controller, "_hidhide_instance_id", None):
+                        detected = True
+                    if is_usb_hid:
+                        wired_pids.add(getattr(controller, "usb_product_id", 0x2069))
             hh_installed = False
-            winusb_bound = True
             if detected:
-                try:
-                    import hidhide
-                    hh_installed = hidhide.is_available()
-                except Exception:
-                    hh_installed = False
-            if detected:
-                # Safety-net only: WinUSB should be auto-bound. If it isn't, activation
-                # (input) will fail, so we warn the user once.
-                winusb_bound = is_pro2_winusb_bound()
+                state = hidhide_service_state()
+                # Undetermined keeps the last known answer instead of flickering
+                # the button to "Install HidHide" on a transient read failure.
+                hh_installed = (self._hidhide_installed_cached if state is None
+                                else state)
 
             def apply():
                 self._wired_pro2_refresh_running = False
                 self.wired_pro2_detected = detected
+                self.wired_controller_pids = sorted(wired_pids)
                 self._hidhide_installed_cached = hh_installed
                 self.update_driver_buttons_visibility()
 
-                # Safety net: pad present but WinUSB not bound -> input won't work.
-                if detected and not winusb_bound and not getattr(self, '_winusb_warn_shown', False):
-                    self._winusb_warn_shown = True
-                    self.show_centered_message(
-                        "Wired Controller",
-                        "Windows is still setting up the wired Pro Controller 2 driver. "
-                        "If the controller doesn't respond, unplug and reconnect it.",
-                    )
-
                 # Auto-prompt HidHide install on first detection while it's absent.
                 if (detected and not hh_installed
+                        and not getattr(CONFIG, 'hidhide_install_prompt_suppressed', False)
                         and not getattr(self, '_wired_pro2_prompt_shown', False)):
                     self._wired_pro2_prompt_shown = True
-                    self.on_wired_usb_driver_button()
+                    if self.ask_hidhide_auto_install():
+                        self.run_hidhide_install(prompt_restart=True)
 
                 if not detected:
-                    # Allow the prompts again next time a pad is (re)connected.
+                    # Allow the prompt again next time a pad is (re)connected.
                     self._wired_pro2_prompt_shown = False
-                    self._winusb_warn_shown = False
 
             try:
                 self.root.after(0, apply)
@@ -10153,12 +13982,12 @@ bg_color=panel_bg, widths=[8, 10])
             return
         self._startup_detection_done = True
 
-        def start_driver_check_and_discovery():
+        def start_driver_check_and_discovery(startup_bridge_context=None):
             try:
                 self.check_driver_installation()
             except Exception as e:
                 logger.debug(f"Startup driver check failed: {e}")
-            self.start_discoverer_thread()
+            self.start_discoverer_thread(startup_bridge_context)
 
         def worker():
             status = None
@@ -10187,7 +14016,16 @@ bg_color=panel_bg, widths=[8, 10])
 
                 if self.maybe_auto_update_esp32s3_firmware(status, on_complete=after_auto_update):
                     return
-                start_driver_check_and_discovery()
+                bridge_context = None
+                if (status
+                        and getattr(status, "bridge_ready", False)
+                        and getattr(status, "firmware_current", False)
+                        and getattr(status, "serial_port", None)):
+                    bridge_context = {
+                        "status": status,
+                        "observed_mono": time.monotonic(),
+                    }
+                start_driver_check_and_discovery(bridge_context)
 
             try:
                 self.root.after(0, apply_status)
@@ -10226,14 +14064,16 @@ bg_color=panel_bg, widths=[8, 10])
             except Exception:
                 pass
             self.root.deiconify()
-            self._prerender_settings_tabs()
             self.root.update_idletasks()
             try:
                 self.root.attributes("-alpha", 1.0)
             except Exception:
                 pass
 
-        self.root.after(100, self.start_detection_and_discovery)
+        # Startup probing is non-blocking.  Settings tabs are built only when the
+        # user selects them; cycling through them after the window is visible
+        # causes a noticeable full-window flash.
+        self.root.after(0, self.start_detection_and_discovery)
             
         # Start battery refresh timer (5 minutes)
         self.root.after(300000, self.start_battery_refresh_timer)
@@ -10243,6 +14083,9 @@ bg_color=panel_bg, widths=[8, 10])
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit); self.root.mainloop()
 
 if __name__ == "__main__":
+    # NOTE: --show-kofi is dispatched at the top of this file, before the heavy
+    # imports, so the popup child never loads the controller stack.
+
     if "--dualsense-server" in sys.argv:
         idx = sys.argv.index("--dualsense-server")
         try:
@@ -10253,7 +14096,7 @@ if __name__ == "__main__":
                 import traceback
                 _log_dir = os.path.join(
                     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                    "Switch2Controllers",
+                    "Switch 2 Connect",
                 )
                 os.makedirs(_log_dir, exist_ok=True)
                 with open(os.path.join(_log_dir, "dualsense_server.log"), "a", encoding="utf-8") as _f:
