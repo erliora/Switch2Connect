@@ -222,7 +222,7 @@ A real Switch (2) Pro Controller does **not** present a standard gamepad HID des
 **Recommendation:** Start with generic HID gamepad (Phase 1 milestone: enumerate + inputs work), then add XInput as a second build profile for game compatibility. Nintendo/DualSense identities become Phase 2 options if gyro passthrough via Steam is wanted. XinHeLianSheng-Pro2-Bridge demonstrates all of these as build-time profiles from one codebase — mirror that structure.
 
 **Deliverables:**
-- [ ] Reverse-engineer Switch 2 BLE report format
+- [x] Reverse-engineer Switch 2 BLE report format → **[docs/SWITCH2_BLE_REPORT_LAYOUT.md](docs/SWITCH2_BLE_REPORT_LAYOUT.md)**
   - Button mapping (from existing firmware parsing)
   - Stick ranges and deadzone
   - Trigger axis ranges
@@ -330,7 +330,7 @@ void ble_to_hid_report(uint8_t *ble_data, uint8_t *hid_report) {
 - Reference issue: [Switch 2 controller protocol research](https://github.com/Nadeflore/switch2-controllers/issues)
 
 **Deliverables:**
-- [ ] Document Switch 2 BLE report byte layout (full mapping table)
+- [x] Document Switch 2 BLE report byte layout (full mapping table) → **[docs/SWITCH2_BLE_REPORT_LAYOUT.md](docs/SWITCH2_BLE_REPORT_LAYOUT.md)**
 - [ ] Implement `ble_to_hid_report()` function
 - [ ] Integration with BLE notify handler
 - [ ] Button/stick calibration (dead zones, ranges)
